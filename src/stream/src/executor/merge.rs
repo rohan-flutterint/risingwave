@@ -146,6 +146,9 @@ impl MergeExecutor {
                     if let Some(update) =
                         barrier.as_update_merge(self.actor_context.id, self.upstream_fragment_id)
                     {
+                        // `Watermark` of upstream may become stale after upstream scaling.
+                        select_all.buffered_watermarks.clear();
+
                         if !update.added_upstream_actor_id.is_empty() {
                             // Create new upstreams receivers.
                             let new_upstreams: Vec<_> = update
@@ -180,16 +183,6 @@ impl MergeExecutor {
                             select_all.remove_upstreams(
                                 &update.removed_upstream_actor_id.iter().copied().collect(),
                             );
-
-                            let col_idxes =
-                                select_all.buffered_watermarks.keys().cloned().collect_vec();
-                            for col_idx in col_idxes {
-                                // Call `check_heap` in case the only upstream(s) that does not have
-                                // watermark in heap is removed
-                                if let Some(watermark) = select_all.check_heap(col_idx) {
-                                    yield Message::Watermark(watermark);
-                                }
-                            }
                         }
                     }
                 }
