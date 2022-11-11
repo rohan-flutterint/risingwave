@@ -319,15 +319,6 @@ impl SelectReceivers {
 
         self.upstreams
             .retain(|u| !upstream_actor_ids.contains(&u.actor_id()));
-        for BufferedWatermarks {
-            first_buffered_watermarks,
-            other_buffered_watermarks,
-        } in self.buffered_watermarks.values_mut()
-        {
-            first_buffered_watermarks
-                .retain(|Reverse((_, actor_id))| !upstream_actor_ids.contains(actor_id));
-            other_buffered_watermarks.retain(|actor_id, _| !upstream_actor_ids.contains(actor_id));
-        }
         self.last_base = 0;
     }
 }
