@@ -1361,6 +1361,23 @@ def section_streaming_actors(outer_panels):
                                       "{{actor_id}} {{side}}"),
                     ],
                 ),
+                panels.timeseries_count(
+                    "Join Key Match Degree",
+                    "",
+                    [
+                        *quantile(
+                            lambda quantile, legend: panels.target(
+                                f"histogram_quantile({quantile}, sum(rate({metric('stream_join_key_match_degree_bucket')}[$__rate_interval])) by (le, actor_id, side, job, instance))",
+                                f"p{legend} {{{{actor_id}}}}.{{{{side}}}} - {{{{job}}}} @ {{{{instance}}}}",
+                            ),
+                            [50, 90, 99, 999, "max"],
+                        ),
+                        panels.target(
+                            f"sum by(le, actor_id, side, job, instance)(rate({metric('stream_join_key_match_degree_sum')}[$__rate_interval])) / sum by(le,actor_id,side,job,instance) (rate({metric('stream_join_key_match_degree_count')}[$__rate_interval]))",
+                            "avg {{actor_id}}.{{side}} - {{job}} @ {{instance}}",
+                        ),
+                    ],
+                ),
                 panels.timeseries_actor_ops(
                     "Aggregation Executor Cache Statistics For Each Key/State",
                     "",

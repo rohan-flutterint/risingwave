@@ -128,12 +128,13 @@ impl<S: MetaStore> HummockManager<S> {
             },
             table_option,
         ));
+        let rewrite_table_ids = vec![];
         // internal states
         for table_id in table_fragments.internal_table_ids() {
             assert_ne!(table_id, table_fragments.table_id().table_id);
             pairs.push((
                 table_id,
-                if is_independent_compaction_group {
+                if is_independent_compaction_group || rewrite_table_ids.contains(&table_id) {
                     CompactionGroupId::from(StaticCompactionGroupId::NewCompactionGroup)
                 } else {
                     CompactionGroupId::from(StaticCompactionGroupId::StateDefault)

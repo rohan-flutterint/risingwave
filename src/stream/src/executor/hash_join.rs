@@ -626,6 +626,9 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                     #[for_await]
                     for chunk in Self::eq_join_oneside::<{ SideType::Left }>(
                         &self.ctx,
+                        &self.metrics,
+                        &actor_id_str,
+                        "left",
                         &self.identity,
                         &mut self.side_l,
                         &mut self.side_r,
@@ -657,6 +660,9 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                     #[for_await]
                     for chunk in Self::eq_join_oneside::<{ SideType::Right }>(
                         &self.ctx,
+                        &self.metrics,
+                        &actor_id_str,
+                        "right",
                         &self.identity,
                         &mut self.side_l,
                         &mut self.side_r,
@@ -715,7 +721,10 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                         //     .with_label_values(&[&actor_id_str, side])
                         //     .set(ht.estimated_size() as i64);
                     }
+<<<<<<< HEAD
 
+=======
+>>>>>>> 52539e03e (feat(streaming): add metrics for matching each side of join)
                     self.metrics
                         .join_match_duration_ns
                         .with_label_values(&[&actor_id_str, "barrier"])
@@ -774,6 +783,9 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
     #[expect(clippy::too_many_arguments)]
     async fn eq_join_oneside<'a, const SIDE: SideTypePrimitive>(
         ctx: &'a ActorContextRef,
+        metrics: &'a Arc<StreamingMetrics>,
+        actor_id_str: &'a str,
+        side_str: &'static str,
         identity: &'a str,
         side_l: &'a mut JoinSide<K, S>,
         side_r: &'a mut JoinSide<K, S>,
@@ -824,14 +836,16 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
         for ((op, row), key) in chunk.rows().zip_eq(keys.iter()) {
             let matched_rows: Option<HashValueType> =
                 Self::hash_eq_match(key, &mut side_match.ht).await?;
+            let mut degree = 0;
+            let mut unconditional_degree = 0;
             match op {
                 Op::Insert | Op::UpdateInsert => {
-                    let mut degree = 0;
                     let mut append_only_matched_row = None;
                     if let Some(mut matched_rows) = matched_rows {
                         for (matched_row_ref, matched_row) in
                             matched_rows.values_mut(&side_match.all_data_types)
                         {
+                            unconditional_degree += 1;
                             let mut matched_row = matched_row?;
                             if check_join_condition(&row, &matched_row.row) {
                                 degree += 1;
@@ -884,11 +898,11 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                     }
                 }
                 Op::Delete | Op::UpdateDelete => {
-                    let mut degree = 0;
                     if let Some(mut matched_rows) = matched_rows {
                         for (matched_row_ref, matched_row) in
                             matched_rows.values_mut(&side_match.all_data_types)
                         {
+                            unconditional_degree += 1;
                             let mut matched_row = matched_row?;
                             if check_join_condition(&row, &matched_row.row) {
                                 degree += 1;
@@ -931,6 +945,10 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                     };
                 }
             }
+            metrics
+                .join_key_match_degree
+                .with_label_values(&[actor_id_str, side_str])
+                .observe(unconditional_degree as f64);
         }
         if let Some(chunk) = hashjoin_chunk_builder.take() {
             yield Message::Chunk(chunk);

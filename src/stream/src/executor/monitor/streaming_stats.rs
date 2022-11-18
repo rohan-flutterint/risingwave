@@ -54,6 +54,7 @@ pub struct StreamingMetrics {
     pub join_cached_entries: GenericGaugeVec<AtomicI64>,
     pub join_cached_rows: GenericGaugeVec<AtomicI64>,
     pub join_cached_estimated_size: GenericGaugeVec<AtomicI64>,
+    pub join_key_match_degree: HistogramVec,
 
     // Streaming Aggregation
     pub agg_lookup_miss_count: GenericCounterVec<AtomicU64>,
@@ -315,6 +316,15 @@ impl StreamingMetrics {
         )
         .unwrap();
 
+        let opts = histogram_opts!(
+            "stream_join_key_match_degree",
+            "join_key_match_degree",
+            exponential_buckets(0.1, 1.65, 25).unwrap() // max 10819 items
+        );
+
+        let join_key_match_degree =
+            register_histogram_vec_with_registry!(opts, &["actor_id", "side"], registry).unwrap();
+
         let agg_lookup_miss_count = register_int_counter_vec_with_registry!(
             "stream_agg_lookup_miss_count",
             "Aggregation executor lookup miss duration",
@@ -442,6 +452,7 @@ impl StreamingMetrics {
             join_cached_entries,
             join_cached_rows,
             join_cached_estimated_size,
+            join_key_match_degree,
             agg_lookup_miss_count,
             agg_total_lookup_count,
             agg_cached_keys,
