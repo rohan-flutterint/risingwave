@@ -351,7 +351,6 @@ where
                     }
                 }
 
-                println!("Command Complete here");
                 self.stream.write_no_flush(&BeMessage::CommandComplete(
                     BeCommandCompleteMessage {
                         stmt_type: res.get_stmt_type(),
