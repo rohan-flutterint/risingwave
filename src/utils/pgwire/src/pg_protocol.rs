@@ -24,7 +24,6 @@ use bytes::{Bytes, BytesMut};
 use futures::stream::StreamExt;
 use futures::Stream;
 use openssl::ssl::{SslAcceptor, SslContext, SslContextRef, SslMethod};
-use risingwave_sqlparser::ast::Statement;
 use risingwave_sqlparser::parser::Parser;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio_openssl::SslStream;
@@ -327,21 +326,13 @@ where
 
         // Execute multiple statements in simple query. KISS later.
         for stmt in stmts {
-            let str_stmt = stmt.to_string();
-
             let session = session.clone();
-            // execute query
-            let mut res = match stmt {
-                Statement::CreateView { .. } => session
-                    .run_one_query(stmt, sql, false)
-                    .await
-                    .map_err(|err| PsqlError::QueryError(err))?,
 
-                _ => session
-                    .run_one_query(stmt, &str_stmt, false)
-                    .await
-                    .map_err(|err| PsqlError::QueryError(err))?,
-            };
+            // execute query
+            let mut res = session
+                .run_one_query(stmt, false)
+                .await
+                .map_err(|err| PsqlError::QueryError(err))?;
 
             if let Some(notice) = res.get_notice() {
                 self.stream
@@ -379,9 +370,7 @@ where
                 ))?;
             }
             self.stream.write_no_flush(&BeMessage::ReadyForQuery)?;
-            println!("Executing stmt Done: {}", str_stmt);
         }
-        println!("Ok to return");
         Ok(())
     }
 
