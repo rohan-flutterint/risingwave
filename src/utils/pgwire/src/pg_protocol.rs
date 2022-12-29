@@ -369,8 +369,10 @@ where
                     },
                 ))?;
             }
-            self.stream.write_no_flush(&BeMessage::ReadyForQuery)?;
         }
+        // Put this line inside the for loop above will lead to unfinished/stuck regress test...Not
+        // sure the reason.
+        self.stream.write_no_flush(&BeMessage::ReadyForQuery)?;
         Ok(())
     }
 
