@@ -1,10 +1,12 @@
 use std::borrow::BorrowMut;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use arc_swap::access::Access;
 use etcd_client::{Client, ConnectOptions, Error, LeaseClient};
 use risingwave_pb::meta::MetaLeaderInfo;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{oneshot, watch, Mutex, MutexGuard};
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_stream::StreamExt;
@@ -12,10 +14,10 @@ use tokio_stream::StreamExt;
 use crate::MetaResult;
 
 pub struct ElectionContext {
+    pub leader: MetaLeaderInfo,
     pub events: watch::Receiver<Option<MetaLeaderInfo>>,
     pub handle: JoinHandle<()>,
     pub stop_sender: oneshot::Sender<()>,
-    pub leader: MetaLeaderInfo,
 }
 
 #[async_trait::async_trait]
@@ -173,25 +175,28 @@ impl EtcdElectionClient {
             Observe,
         }
 
-        let mut _client = self.client.clone();
         let mut client = self.client.clone();
         let mut stop = stop;
 
-        let mut lease_session = self.lease_session(lease_ttl).await.expect("lease ");
+        let mut lease_session = self
+            .lease_session(lease_ttl)
+            .await
+            .expect("lease session must available");
 
         let (sender, receiver) = watch::channel::<Option<MetaLeaderInfo>>(None);
-        let event_sender = sender;
 
         let id = value.clone();
+
+        let current_leader_x: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let current_leader = current_leader_x.clone();
+
+        let event_sender = sender;
 
         let fallback_timeout = Duration::from_secs(1);
         let join_handle = tokio::spawn(async move {
             let mut state = State::Init;
-            let mut current_leader = None;
 
-            let lease = lease_session.lease_id;
-
-            tracing::info!("init election with lease id {}", lease);
+            tracing::info!("init election with lease id {}", lease_session.lease_id);
 
             let mut ticker = time::interval(fallback_timeout);
             loop {
@@ -224,9 +229,10 @@ impl EtcdElectionClient {
 
                         let discovered_leader_id = leader_kv.value().to_vec();
 
-                        if match &mut current_leader {
+                        let mut guard = current_leader.lock().await;
+                        if match guard.as_mut() {
                             None => true,
-                            Some(current_leader_id) => *current_leader_id != discovered_leader_id,
+                            Some(leader_id) => *leader_id != discovered_leader_id,
                         } {
                             event_sender
                                 .send(Some(MetaLeaderInfo {
@@ -235,7 +241,7 @@ impl EtcdElectionClient {
                                 }))
                                 .unwrap();
 
-                            current_leader = Some(discovered_leader_id);
+                            *guard = Some(discovered_leader_id);
                         }
 
                         if leader_kv.value() == id.as_slice() {
@@ -251,7 +257,7 @@ impl EtcdElectionClient {
                     }
                     State::Campaign => {
                         tokio::select! {
-                            resp = client.campaign(META_ELECTION_KEY, id.clone(), lease) => {
+                            resp = client.campaign(META_ELECTION_KEY, id.clone(), lease_session.lease_id) => {
                                 match resp {
                                     Ok(_) => {
                                         tracing::info!("election campaign done, changing state to observe mode");
@@ -275,16 +281,12 @@ impl EtcdElectionClient {
                         let mut observe_stream = client
                             .observe(META_ELECTION_KEY)
                             .await
-                            .expect("creating observe stream failed");
-
-                        let mut ticker =
-                            time::interval(Duration::from_secs((lease_ttl / 2) as u64));
+                            .expect("creating observe stream failed, fail asap");
 
                         loop {
-                            ticker.tick().await;
-
                             tokio::select! {
                                 _ = stop.borrow_mut() => {
+                                    lease_session.drop_session().await;
                                     return
                                 }
 
@@ -313,35 +315,28 @@ impl EtcdElectionClient {
                         }
                     }
 
-                    State::Reconnect => {
-                        let mut ticker = time::interval(fallback_timeout);
-
-                        loop {
-                            ticker.tick().await;
-                            match client.status().await {
-                                Ok(s) => {
-                                    tracing::info!("etcd election server status is {:?}", s);
-                                    state = State::Init;
-                                    break;
-                                }
-                                Err(e) => {
-                                    tracing::error!(
-                                        "etcd election server status is failed {}",
-                                        e.to_string()
-                                    );
-                                }
-                            }
+                    State::Reconnect => match client.status().await {
+                        Ok(s) => {
+                            tracing::info!("etcd election server status is {:?}", s);
+                            state = State::Init;
+                            continue;
                         }
-                    }
+                        Err(e) => {
+                            tracing::error!(
+                                "etcd election server status is failed {}",
+                                e.to_string()
+                            );
+                        }
+                    },
                 }
             }
         });
 
         let mut ticker = time::interval(fallback_timeout);
 
-        let init_leader_kv = loop {
+        let leader_info = loop {
             ticker.tick().await;
-            let leader_resp = _client.leader(META_ELECTION_KEY).await;
+            let leader_resp = self.client.clone().leader(META_ELECTION_KEY).await;
             match leader_resp {
                 Ok(mut leader) => {
                     let kv = match leader.take_kv() {
@@ -349,7 +344,20 @@ impl EtcdElectionClient {
                         Some(kv) => kv,
                     };
 
-                    break kv;
+                    let discovered_leader_id = kv.value().to_vec();
+                    // todo
+                    let mut guard = current_leader_x.lock().await;
+                    if match guard.as_mut() {
+                        None => true,
+                        Some(leader_id) => *leader_id != discovered_leader_id,
+                    } {
+                        *guard = Some(discovered_leader_id);
+                    }
+
+                    break MetaLeaderInfo {
+                        node_address: Self::value_to_address(&discovered_leader_id),
+                        lease_id: kv.lease() as u64,
+                    };
                 }
                 Err(Error::GRpcStatus(e)) if e.message() == "election: no leader" => {
                     tracing::info!("waiting for first leader");
@@ -362,14 +370,7 @@ impl EtcdElectionClient {
             };
         };
 
-        Ok((
-            join_handle,
-            receiver,
-            MetaLeaderInfo {
-                node_address: Self::value_to_address(init_leader_kv.value()),
-                lease_id: init_leader_kv.lease() as u64,
-            },
-        ))
+        Ok((join_handle, receiver, leader_info))
     }
 }
 
