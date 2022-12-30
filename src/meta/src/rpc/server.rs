@@ -128,7 +128,7 @@ fn node_is_leader(leader_rx: &WatchReceiver<Option<MetaLeaderInfo>>, id: String)
 
 pub async fn rpc_serve_with_store<S: MetaStore, C: ElectionClient>(
     meta_store: Arc<S>,
-    mut election_client: Box<C>,
+    election_client: Box<C>,
     address_info: AddressInfo,
     max_heartbeat_interval: Duration,
     lease_interval_secs: u64,
