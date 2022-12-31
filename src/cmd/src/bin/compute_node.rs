@@ -22,7 +22,8 @@ enable_task_local_jemalloc_on_linux!();
 fn main() {
     use clap::StructOpt;
 
-    let opts = risingwave_compute::ComputeNodeOpts::parse();
+    let mut opts = risingwave_compute::ComputeNodeOpts::parse();
+    opts.parallelism = 1;
 
     risingwave_rt::init_risingwave_logger(risingwave_rt::LoggerSettings::new(false));
 

@@ -128,6 +128,7 @@ impl<S: MetaStore> HummockManager<S> {
             },
             table_option,
         ));
+        // let rewrite_table_ids = vec![1006, 1008];
         let rewrite_table_ids = vec![];
         // internal states
         for table_id in table_fragments.internal_table_ids() {

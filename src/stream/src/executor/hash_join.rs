@@ -623,6 +623,7 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                 AlignedMessage::Left(chunk) => {
                     let mut left_time = Duration::from_nanos(0);
                     let mut left_start_time = minstant::Instant::now();
+                    let mut join_miss = true;
                     #[for_await]
                     for chunk in Self::eq_join_oneside::<{ SideType::Left }>(
                         &self.ctx,
@@ -638,6 +639,7 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                         self.append_only_optimize,
                         self.chunk_size,
                     ) {
+                        join_miss = false;
                         left_time += left_start_time.elapsed();
                         yield chunk.map(|v| match v {
                             Message::Watermark(_) => {
@@ -649,14 +651,22 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                         left_start_time = minstant::Instant::now();
                     }
                     left_time += left_start_time.elapsed();
-                    self.metrics
-                        .join_match_duration_ns
-                        .with_label_values(&[&actor_id_str, "left"])
-                        .inc_by(left_time.as_nanos() as u64);
+                    if join_miss {
+                        self.metrics
+                            .join_match_duration_ns
+                            .with_label_values(&[&actor_id_str, "left_miss"])
+                            .inc_by(left_time.as_nanos() as u64);
+                    } else {
+                        self.metrics
+                            .join_match_duration_ns
+                            .with_label_values(&[&actor_id_str, "left"])
+                            .inc_by(left_time.as_nanos() as u64);
+                    }
                 }
                 AlignedMessage::Right(chunk) => {
                     let mut right_time = Duration::from_nanos(0);
                     let mut right_start_time = minstant::Instant::now();
+                    let mut join_miss = true;
                     #[for_await]
                     for chunk in Self::eq_join_oneside::<{ SideType::Right }>(
                         &self.ctx,
@@ -672,6 +682,7 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                         self.append_only_optimize,
                         self.chunk_size,
                     ) {
+                        join_miss = false;
                         right_time += right_start_time.elapsed();
                         yield chunk.map(|v| match v {
                             Message::Watermark(_) => {
@@ -683,10 +694,17 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                         right_start_time = minstant::Instant::now();
                     }
                     right_time += right_start_time.elapsed();
-                    self.metrics
-                        .join_match_duration_ns
-                        .with_label_values(&[&actor_id_str, "right"])
-                        .inc_by(right_time.as_nanos() as u64);
+                    if join_miss {
+                        self.metrics
+                            .join_match_duration_ns
+                            .with_label_values(&[&actor_id_str, "right_miss"])
+                            .inc_by(right_time.as_nanos() as u64);
+                    } else {
+                        self.metrics
+                            .join_match_duration_ns
+                            .with_label_values(&[&actor_id_str, "right"])
+                            .inc_by(right_time.as_nanos() as u64);
+                    }
                 }
                 AlignedMessage::Barrier(barrier) => {
                     let barrier_start_time = minstant::Instant::now();
@@ -721,10 +739,6 @@ impl<K: HashKey, S: StateStore, const T: JoinTypePrimitive> HashJoinExecutor<K, 
                         //     .with_label_values(&[&actor_id_str, side])
                         //     .set(ht.estimated_size() as i64);
                     }
-<<<<<<< HEAD
-
-=======
->>>>>>> 52539e03e (feat(streaming): add metrics for matching each side of join)
                     self.metrics
                         .join_match_duration_ns
                         .with_label_values(&[&actor_id_str, "barrier"])

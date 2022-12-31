@@ -154,10 +154,14 @@ impl SharedContext {
             )
         } else {
             permit::channel(
-                65536,
+                131072,
                 2048,
             )
         };
+        // let (tx, rx) = permit::channel(
+        //     self.config.developer.stream_exchange_initial_permits,
+        //     self.config.developer.stream_exchange_batched_permits,
+        // );
         assert!(
             self.lock_channel_map()
                 .insert(ids, (Some(tx), Some(rx)))
