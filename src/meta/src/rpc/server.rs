@@ -155,7 +155,7 @@ pub async fn rpc_serve_with_store<S: MetaStore, C: ElectionClient>(
 
     let mut services_leader_rx = leader_rx.clone();
 
-    let current_leader = leader.clone();
+    let current_leader = leader;
 
     let join_handle = tokio::spawn(async move {
         let span = tracing::span!(tracing::Level::INFO, "services");
