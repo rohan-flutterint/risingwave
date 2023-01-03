@@ -1,5 +1,6 @@
 use std::borrow::BorrowMut;
-
+use std::marker::PhantomData;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -10,6 +11,8 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_stream::StreamExt;
 
+use crate::rpc::elections::run_elections;
+use crate::storage::MetaStore;
 use crate::MetaResult;
 
 pub struct ElectionContext {
@@ -297,7 +300,7 @@ impl EtcdElectionClient {
                                             None => continue,
                                         },
                                         Err(e) => {
-                                            tracing::info!("observing stream failed {}", e.to_string());
+                                            tracing::error!("observing stream failed {}", e.to_string());
                                             state = State::Reconnect;
 
                                             break;
@@ -394,5 +397,26 @@ impl EtcdElectionClient {
         let client = Client::connect(&endpoints, options.clone()).await.unwrap();
 
         Ok(Self { client })
+    }
+}
+
+pub struct KvBasedElectionClient<S: MetaStore> {
+    meta_store: Arc<S>,
+}
+
+#[async_trait::async_trait]
+impl<S: MetaStore> ElectionClient for KvBasedElectionClient<S> {
+    async fn start(&self, id: String, lease_ttl: i64) -> MetaResult<ElectionContext> {
+        let (leader, handle, stop_sender, events) =
+            run_elections(id, self.meta_store.clone(), lease_ttl as u64).await?;
+
+        let ctx = ElectionContext {
+            leader,
+            events,
+            handle,
+            stop_sender,
+        };
+
+        Ok(ctx)
     }
 }
