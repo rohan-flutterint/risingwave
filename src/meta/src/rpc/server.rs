@@ -119,10 +119,10 @@ pub async fn rpc_serve(
     }
 }
 
-fn node_is_leader(leader_rx: &WatchReceiver<Option<MetaLeaderInfo>>, id: String) -> bool {
+fn node_is_leader(leader_rx: &WatchReceiver<Option<MetaLeaderInfo>>, id: &str) -> bool {
     match &*leader_rx.borrow() {
         None => false,
-        Some(leader) => leader.node_address == id,
+        Some(leader) => leader.node_address == *id,
     }
 }
 
@@ -147,6 +147,8 @@ pub async fn rpc_serve_with_store<S: MetaStore, C: ElectionClient>(
         leader,
     } = ctx;
 
+    println!("leader is {:?}", leader);
+
     let election_handle = handle;
     let election_shutdown = stop_sender;
     let mut leader_rx = events;
@@ -154,8 +156,6 @@ pub async fn rpc_serve_with_store<S: MetaStore, C: ElectionClient>(
     let (svc_shutdown_tx, mut svc_shutdown_rx) = WatchChannel(());
 
     let mut services_leader_rx = leader_rx.clone();
-
-    let current_leader = leader;
 
     let join_handle = tokio::spawn(async move {
         let span = tracing::span!(tracing::Level::INFO, "services");
@@ -167,12 +167,14 @@ pub async fn rpc_serve_with_store<S: MetaStore, C: ElectionClient>(
             .await
             .expect("Leader sender dropped");
 
+        println!("leader updated {:?}", *services_leader_rx.borrow());
+
         // run follower services until node becomes leader
         // FIXME: Add service discovery for follower
         // https://github.com/risingwavelabs/risingwave/issues/6755
         let svc_shutdown_rx_clone = svc_shutdown_rx.clone();
         let (follower_shutdown_tx, follower_shutdown_rx) = OneChannel::<()>();
-        let follower_handle: Option<JoinHandle<()>> = if !node_is_leader(&leader_rx, id.clone()) {
+        let follower_handle: Option<JoinHandle<()>> = if !node_is_leader(&leader_rx, &id) {
             let address_info_clone = address_info.clone();
             Some(tokio::spawn(async move {
                 let _ = tracing::span!(tracing::Level::INFO, "follower services").enter();
@@ -188,7 +190,7 @@ pub async fn rpc_serve_with_store<S: MetaStore, C: ElectionClient>(
         };
 
         // wait until this node becomes a leader
-        while !node_is_leader(&leader_rx, id.clone()) {
+        while !node_is_leader(&leader_rx, &id) {
             tokio::select! {
                 _ = leader_rx.changed() => {}
                 res = svc_shutdown_rx.changed() => {
@@ -221,7 +223,7 @@ pub async fn rpc_serve_with_store<S: MetaStore, C: ElectionClient>(
             address_info,
             max_heartbeat_interval,
             opts,
-            current_leader,
+            leader,
             elect_coord,
             svc_shutdown_rx,
         )
