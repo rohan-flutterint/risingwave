@@ -28,7 +28,8 @@ use super::follower_svc::start_follower_srv;
 use super::leader_svc::ElectionCoordination;
 use crate::manager::MetaOpts;
 use crate::rpc::election::{
-    ElectionClient, ElectionContext, EtcdElectionClient, MemoryElectionClient,
+    ElectionClient, ElectionContext, EtcdElectionClient, KvBasedElectionClient,
+    MemoryElectionClient,
 };
 use crate::rpc::leader_svc::start_leader_srv;
 use crate::storage::{EtcdMetaStore, MemStore, MetaStore, WrappedEtcdClient as EtcdClient};
@@ -90,8 +91,10 @@ pub async fn rpc_serve(
             .map_err(|e| anyhow::anyhow!("failed to connect etcd {}", e))?;
             let meta_store = Arc::new(EtcdMetaStore::new(client));
 
-            let election_client =
-                Box::new(EtcdElectionClient::new(endpoints, Some(options), false).await?);
+            // let election_client =
+            //     Box::new(EtcdElectionClient::new(endpoints, Some(options), false).await?);
+
+            let election_client = Box::new(KvBasedElectionClient::new(meta_store.clone()).await);
 
             rpc_serve_with_store(
                 meta_store,
@@ -270,7 +273,7 @@ mod tests {
             node_controllers.push(
                 rpc_serve_with_store(
                     meta_store.clone(),
-                    Box::new(MemoryElectionClient::new()),
+                    Box::new(KvBasedElectionClient::new(meta_store.clone()).await),
                     info,
                     Duration::from_secs(4),
                     1,
