@@ -6402,6 +6402,7 @@ dependencies = [
  "futures-async-stream",
  "gen-iter",
  "hyper",
+ "hytra",
  "iter-chunks",
  "itertools",
  "local_stats_alloc",
