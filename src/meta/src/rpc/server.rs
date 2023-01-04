@@ -144,8 +144,6 @@ pub async fn rpc_serve_with_store<S: MetaStore, C: ElectionClient>(
         leader,
     } = ctx;
 
-    println!("leader is {:?}", leader);
-
     let election_handle = handle;
     let election_shutdown = stop_sender;
     let mut leader_rx = events;
@@ -163,8 +161,6 @@ pub async fn rpc_serve_with_store<S: MetaStore, C: ElectionClient>(
             .changed()
             .await
             .expect("Leader sender dropped");
-
-        println!("leader updated {:?}", *services_leader_rx.borrow());
 
         // run follower services until node becomes leader
         // FIXME: Add service discovery for follower
