@@ -154,7 +154,7 @@ impl EtcdElectionClient {
             Observe,
         }
 
-        let mut client = self.client.clone();
+        let client = self.client.clone();
         let mut stop = stop;
 
         let mut lease_session = self
@@ -184,26 +184,29 @@ impl EtcdElectionClient {
 
                 match state {
                     State::Init => {
-                        let leader_kv = match client.leader(META_ELECTION_KEY).await {
-                            Ok(mut leader) => match leader.take_kv() {
-                                None => continue,
-                                Some(kv) => kv,
-                            },
-                            Err(Error::GRpcStatus(e)) if e.message() == "election: no leader" => {
-                                tracing::info!("no leader now, run election");
+                        let leader_kv =
+                            match client.election_client().leader(META_ELECTION_KEY).await {
+                                Ok(mut leader) => match leader.take_kv() {
+                                    None => continue,
+                                    Some(kv) => kv,
+                                },
+                                Err(Error::GRpcStatus(e))
+                                    if e.message() == "election: no leader" =>
+                                {
+                                    tracing::info!("no leader now, run election");
 
-                                // no leader now
-                                state = State::Campaign;
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::error!("error happened when calling leader {}", e);
+                                    // no leader now
+                                    state = State::Campaign;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    tracing::error!("error happened when calling leader {}", e);
 
-                                // todo, continue is ok?
-                                state = State::Reconnect;
-                                continue;
-                            }
-                        };
+                                    // todo, continue is ok?
+                                    state = State::Reconnect;
+                                    continue;
+                                }
+                            };
 
                         let discovered_leader_id = leader_kv.value().to_vec();
 
@@ -233,8 +236,9 @@ impl EtcdElectionClient {
                         }
                     }
                     State::Campaign => {
+                        let mut election_client = client.election_client();
                         tokio::select! {
-                            resp = client.campaign(META_ELECTION_KEY, id.clone(), lease_session.lease_id) => {
+                            resp = election_client.campaign(META_ELECTION_KEY, id.clone(), lease_session.lease_id) => {
                                 match resp {
                                     Ok(_) => {
                                         tracing::info!("election campaign done, changing state to observe mode");
@@ -256,6 +260,7 @@ impl EtcdElectionClient {
                     }
                     State::Observe => {
                         let mut observe_stream = client
+                            .election_client()
                             .observe(META_ELECTION_KEY)
                             .await
                             .expect("creating observe stream failed, fail asap");
@@ -292,7 +297,7 @@ impl EtcdElectionClient {
                         }
                     }
 
-                    State::Reconnect => match client.status().await {
+                    State::Reconnect => match client.maintenance_client().status().await {
                         Ok(s) => {
                             tracing::info!("etcd election server status is {:?}", s);
                             state = State::Init;
@@ -313,7 +318,11 @@ impl EtcdElectionClient {
 
         let leader_info = loop {
             ticker.tick().await;
-            let leader_resp = self.client.clone().leader(META_ELECTION_KEY).await;
+            let leader_resp = self
+                .client
+                .election_client()
+                .leader(META_ELECTION_KEY)
+                .await;
             match leader_resp {
                 Ok(mut leader) => {
                     let kv = match leader.take_kv() {
