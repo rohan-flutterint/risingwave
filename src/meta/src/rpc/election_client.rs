@@ -1,5 +1,4 @@
 use std::borrow::BorrowMut;
-use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +13,7 @@ use tokio_stream::StreamExt;
 use crate::rpc::elections::run_elections;
 use crate::storage::MetaStore;
 use crate::MetaResult;
+const META_ELECTION_KEY: &str = "ELECTION";
 
 pub struct ElectionContext {
     pub leader: MetaLeaderInfo,
@@ -25,40 +25,6 @@ pub struct ElectionContext {
 #[async_trait::async_trait]
 pub trait ElectionClient {
     async fn start(&self, id: String, lease_ttl: i64) -> MetaResult<ElectionContext>;
-}
-
-pub struct MemoryElectionClient {}
-
-impl MemoryElectionClient {
-    pub fn new() -> Self {
-        MemoryElectionClient {}
-    }
-}
-
-#[async_trait::async_trait]
-impl ElectionClient for MemoryElectionClient {
-    async fn start(&self, id: String, _lease_ttl: i64) -> MetaResult<ElectionContext> {
-        let (sender, receiver) = tokio::sync::watch::channel(None);
-        let (stop_sender, stop_receiver) = oneshot::channel();
-        let leader = MetaLeaderInfo {
-            node_address: id,
-            lease_id: 0,
-        };
-
-        let _leader = leader.clone();
-        let handle = tokio::spawn(async move {
-            sender.send(Some(_leader)).unwrap();
-            stop_receiver.await.unwrap();
-        });
-
-        let result = Ok(ElectionContext {
-            events: receiver,
-            handle,
-            stop_sender,
-            leader,
-        });
-        return result;
-    }
 }
 
 pub struct EtcdElectionClient {
@@ -112,13 +78,12 @@ impl EtcdLeaseSession {
         loop {
             ticker.tick().await;
             if let Err(e) = lease_keeper.keep_alive().await {
-                println!("lease keeper failed {}", e);
+                tracing::error!("lease keeper failed {}, recreating", e);
 
                 let (new_keeper, _stream) = match lease_client.keep_alive(lease_id).await {
                     Ok((a, b)) => (a, b),
                     Err(e) => {
-                        println!("rebuild lease keeper failed {}", e);
-
+                        tracing::error!("rebuild lease keeper failed {}", e);
                         continue;
                     }
                 };
@@ -128,8 +93,6 @@ impl EtcdLeaseSession {
         }
     }
 }
-
-const META_ELECTION_KEY: &str = "ELECTION";
 
 impl EtcdElectionClient {
     async fn lease_session(&self, ttl: i64) -> MetaResult<EtcdLeaseSession> {
@@ -191,7 +154,7 @@ impl EtcdElectionClient {
 
         let event_sender = sender;
 
-        let fallback_timeout = Duration::from_secs(1);
+        let ticker_period = Duration::from_secs(1);
         let join_handle = tokio::spawn(async move {
             let mut state = State::Init;
 
@@ -199,7 +162,7 @@ impl EtcdElectionClient {
 
             tracing::info!("init election with lease id {}", lease_session.lease_id);
 
-            let mut ticker = time::interval(fallback_timeout);
+            let mut ticker = time::interval(ticker_period);
             loop {
                 ticker.tick().await;
 
@@ -332,7 +295,7 @@ impl EtcdElectionClient {
             }
         });
 
-        let mut ticker = time::interval(fallback_timeout);
+        let mut ticker = time::interval(ticker_period);
 
         let leader_info = loop {
             ticker.tick().await;
@@ -387,6 +350,7 @@ impl ElectionClient for EtcdElectionClient {
 }
 
 impl EtcdElectionClient {
+    #[allow(dead_code)]
     pub(crate) async fn new(
         endpoints: Vec<String>,
         options: Option<ConnectOptions>,
@@ -394,7 +358,9 @@ impl EtcdElectionClient {
     ) -> MetaResult<Self> {
         assert!(!auth_enabled, "auth not supported");
 
-        let client = Client::connect(&endpoints, options.clone()).await.unwrap();
+        let client = Client::connect(&endpoints, options.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         Ok(Self { client })
     }
@@ -405,10 +371,8 @@ pub struct KvBasedElectionClient<S: MetaStore> {
 }
 
 impl<S: MetaStore> KvBasedElectionClient<S> {
-    pub async fn new(meta_store: Arc<S>) -> KvBasedElectionClient<S> {
-        Self {
-            meta_store: meta_store.clone(),
-        }
+    pub fn new(meta_store: Arc<S>) -> KvBasedElectionClient<S> {
+        Self { meta_store }
     }
 }
 
