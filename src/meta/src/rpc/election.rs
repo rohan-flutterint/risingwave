@@ -404,6 +404,14 @@ pub struct KvBasedElectionClient<S: MetaStore> {
     meta_store: Arc<S>,
 }
 
+impl<S: MetaStore> KvBasedElectionClient<S> {
+    pub async fn new(meta_store: Arc<S>) -> KvBasedElectionClient<S> {
+        Self {
+            meta_store: meta_store.clone(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl<S: MetaStore> ElectionClient for KvBasedElectionClient<S> {
     async fn start(&self, id: String, lease_ttl: i64) -> MetaResult<ElectionContext> {
