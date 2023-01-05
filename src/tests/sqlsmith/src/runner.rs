@@ -88,6 +88,10 @@ async fn test_batch_queries<R: Rng>(
         let response = client.query(sql.as_str(), &[]).await;
         skipped += validate_response(setup_sql, &format!("{};", sql), response);
     }
+    client
+        .query("SSET query_mode TO distributed;", &[])
+        .await
+        .unwrap();
     skipped as f64 / sample_size as f64
 }
 
