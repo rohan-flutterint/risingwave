@@ -76,7 +76,7 @@ pub async fn start_leader_srv<S: MetaStore>(
     max_heartbeat_interval: Duration,
     opts: MetaOpts,
     current_leader: MetaLeaderInfo,
-    election_coordination: ElectionCoordination,
+    //election_coordination: ElectionCoordination,
     mut svc_shutdown_rx: WatchReceiver<()>,
 ) -> MetaResult<()> {
     tracing::info!("Defining leader services");
@@ -281,10 +281,10 @@ pub async fn start_leader_srv<S: MetaStore>(
         .await,
     );
     sub_tasks.push(HummockManager::start_compaction_heartbeat(hummock_manager).await);
-    sub_tasks.push((
-        election_coordination.election_handle,
-        election_coordination.election_shutdown,
-    ));
+    // sub_tasks.push((
+    //     election_coordination.election_handle,
+    //     election_coordination.election_shutdown,
+    // ));
     if cfg!(not(test)) {
         sub_tasks.push(
             ClusterManager::start_heartbeat_checker(cluster_manager, Duration::from_secs(1)).await,

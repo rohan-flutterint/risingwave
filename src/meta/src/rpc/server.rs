@@ -13,21 +13,24 @@
 // limitations under the License.
 
 use std::net::SocketAddr;
+use std::process::exit;
 use std::sync::Arc;
 use std::time::Duration;
 
 use etcd_client::ConnectOptions;
 use risingwave_pb::meta::MetaLeaderInfo;
 use tokio::sync::oneshot::channel as OneChannel;
+use tokio::sync::watch;
 use tokio::sync::watch::{
     channel as WatchChannel, Receiver as WatchReceiver, Sender as WatchSender,
 };
 use tokio::task::JoinHandle;
+use tokio::time;
 
 use super::follower_svc::start_follower_srv;
 use super::leader_svc::ElectionCoordination;
 use crate::manager::MetaOpts;
-use crate::rpc::election_client::{ElectionClient, ElectionContext, KvBasedElectionClient};
+use crate::rpc::election_client::{ElectionClient, ElectionContext, EtcdElectionClient};
 use crate::rpc::leader_svc::start_leader_srv;
 use crate::storage::{EtcdMetaStore, MemStore, MetaStore, WrappedEtcdClient as EtcdClient};
 use crate::MetaResult;
@@ -88,11 +91,13 @@ pub async fn rpc_serve(
             .map_err(|e| anyhow::anyhow!("failed to connect etcd {}", e))?;
             let meta_store = Arc::new(EtcdMetaStore::new(client));
 
-            let election_client = Box::new(KvBasedElectionClient::new(meta_store.clone()));
+            // let election_client = Arc::new(KvBasedElectionClient::new(meta_store.clone()));
+            let election_client =
+                Arc::new(EtcdElectionClient::new(endpoints, Some(options), false).await?);
 
-            rpc_serve_with_store(
+            rpc_serve_with_store2(
                 meta_store,
-                election_client,
+                Some(election_client),
                 address_info,
                 max_heartbeat_interval,
                 lease_interval_secs,
@@ -101,123 +106,86 @@ pub async fn rpc_serve(
             .await
         }
         MetaStoreBackend::Mem => {
-            let meta_store = Arc::new(MemStore::new());
-            let election_client = Box::new(KvBasedElectionClient::new(meta_store.clone()));
-            rpc_serve_with_store(
-                meta_store,
-                election_client,
-                address_info,
-                max_heartbeat_interval,
-                lease_interval_secs,
-                opts,
-            )
-            .await
+            todo!()
+            // let meta_store = Arc::new(MemStore::new());
+            // rpc_serve_with_store2(
+            //     meta_store,
+            //     None,
+            //     address_info,
+            //     max_heartbeat_interval,
+            //     lease_interval_secs,
+            //     opts,
+            // )
+            // .await
         }
     }
 }
 
-fn node_is_leader(leader_rx: &WatchReceiver<Option<MetaLeaderInfo>>, id: &str) -> bool {
-    match &*leader_rx.borrow() {
-        None => false,
-        Some(leader) => leader.node_address == *id,
-    }
-}
-
-pub async fn rpc_serve_with_store<S: MetaStore, C: ElectionClient>(
+pub async fn rpc_serve_with_store2<S: MetaStore, C: ElectionClient + 'static>(
     meta_store: Arc<S>,
-    election_client: Box<C>,
+    election_client: Option<Arc<C>>,
     address_info: AddressInfo,
     max_heartbeat_interval: Duration,
     lease_interval_secs: u64,
     opts: MetaOpts,
 ) -> MetaResult<(JoinHandle<()>, WatchSender<()>)> {
-    let id = address_info.listen_addr.clone().to_string();
+    let (svc_shutdown_tx, svc_shutdown_rx) = watch::channel(());
 
-    let ctx = election_client
-        .start(id.clone(), lease_interval_secs as i64)
-        .await?;
-
-    let ElectionContext {
-        events,
-        handle,
-        stop_sender,
-        leader,
-    } = ctx;
-
-    let election_handle = handle;
-    let election_shutdown = stop_sender;
-    let mut leader_rx = events;
-
-    let (svc_shutdown_tx, mut svc_shutdown_rx) = WatchChannel(());
-
-    let mut services_leader_rx = leader_rx.clone();
+    // if let Some(election_client) = election_client.clone() {
+    //     tokio::spawn(async move {
+    //
+    //         let e = election_client.clone();
+    //         while let Err(e) = e.campaign(lease_interval_secs as i64).await {
+    //             tracing::error!("election error happened")
+    //         }
+    //
+    //         exit(0);
+    //     });
+    // }
 
     let join_handle = tokio::spawn(async move {
-        let span = tracing::span!(tracing::Level::INFO, "services");
-        let _enter = span.enter();
+        if let Some(election_client) = election_client {
+            let svc_shutdown_rx_clone = svc_shutdown_rx.clone();
+            let (follower_shutdown_tx, follower_shutdown_rx) = OneChannel::<()>();
+            let follower_handle: Option<JoinHandle<()>> = if !election_client.is_leader() {
+                let address_info_clone = address_info.clone();
+                Some(tokio::spawn(async move {
+                    let _ = tracing::span!(tracing::Level::INFO, "follower services").enter();
+                    start_follower_srv(
+                        svc_shutdown_rx_clone,
+                        follower_shutdown_rx,
+                        address_info_clone,
+                    )
+                    .await;
+                }))
+            } else {
+                None
+            };
 
-        // failover logic
-        services_leader_rx
-            .changed()
-            .await
-            .expect("Leader sender dropped");
+            let mut ticker = time::interval(Duration::from_secs(1));
 
-        // run follower services until node becomes leader
-        // FIXME: Add service discovery for follower
-        // https://github.com/risingwavelabs/risingwave/issues/6755
-        let svc_shutdown_rx_clone = svc_shutdown_rx.clone();
-        let (follower_shutdown_tx, follower_shutdown_rx) = OneChannel::<()>();
-        let follower_handle: Option<JoinHandle<()>> = if !node_is_leader(&leader_rx, &id) {
-            let address_info_clone = address_info.clone();
-            Some(tokio::spawn(async move {
-                let _ = tracing::span!(tracing::Level::INFO, "follower services").enter();
-                start_follower_srv(
-                    svc_shutdown_rx_clone,
-                    follower_shutdown_rx,
-                    address_info_clone,
-                )
-                .await;
-            }))
-        } else {
-            None
+            while !election_client.is_leader() {
+                ticker.tick().await;
+            }
+
+            if let Some(handle) = follower_handle {
+                let _res = follower_shutdown_tx.send(());
+                let _ = handle.await;
+            }
         };
 
-        // wait until this node becomes a leader
-        while !node_is_leader(&leader_rx, &id) {
-            tokio::select! {
-                _ = leader_rx.changed() => {}
-                res = svc_shutdown_rx.changed() => {
-                    match res {
-                        Ok(_) => tracing::info!("Shutting down meta node"),
-                        Err(_) => tracing::error!("Shutdown sender dropped"),
-                    }
-                    return;
-                }
-            }
-        }
-
-        // shut down follower svc if node used to be follower
-        if let Some(handle) = follower_handle {
-            match follower_shutdown_tx.send(()) {
-                Ok(_) => tracing::info!("Shutting down follower services"),
-                Err(_) => tracing::error!("Follower service receiver dropped"),
-            }
-            // Wait until follower service is down
-            handle.await.unwrap();
-        }
-
-        let elect_coord = ElectionCoordination {
-            election_handle,
-            election_shutdown,
-        };
+        // let elect_coord = ElectionCoordination {
+        //     election_handle,
+        //     election_shutdown,
+        // };
 
         start_leader_srv(
             meta_store,
             address_info,
             max_heartbeat_interval,
             opts,
-            leader,
-            elect_coord,
+            MetaLeaderInfo::default(),
+            //            elect_coord,
             svc_shutdown_rx,
         )
         .await
