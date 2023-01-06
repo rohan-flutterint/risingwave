@@ -12,29 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::borrow::BorrowMut;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::anyhow;
-use etcd_client::{Client, ConnectOptions, Error, LeaseClient};
+use etcd_client::{Client, ConnectOptions, Error};
 use risingwave_pb::meta::MetaLeaderInfo;
-use tokio::sync::{oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
 use tokio::time;
 use tokio_stream::StreamExt;
 
-use crate::rpc::elections::run_elections;
-use crate::storage::MetaStore;
 use crate::MetaResult;
 const META_ELECTION_KEY: &str = "ELECTION";
 
 #[async_trait::async_trait]
 pub trait ElectionClient: Send + Sync + 'static {
-    async fn campaign(&self, ttl: i64) -> MetaResult<()>;
+    async fn run_once(&self, ttl: i64) -> MetaResult<()>;
     async fn leader(&self) -> MetaResult<Option<MetaLeaderInfo>>;
-    //async fn get_members(&self) -> MetaResult<Vec<(String, bool)>>;
+    // async fn get_members(&self) -> MetaResult<Vec<(String, bool)>>;
     fn is_leader(&self) -> bool;
 }
 
@@ -65,32 +59,33 @@ impl ElectionClient for EtcdElectionClient {
         }
 
         let mut election_client = self.client.election_client();
-        let mut leader = election_client.leader(META_ELECTION_KEY).await;
+        let leader = election_client.leader(META_ELECTION_KEY).await;
 
         let leader = match leader {
             Ok(leader) => Ok(Some(leader)),
             Err(Error::GRpcStatus(e)) if e.message() == "election: no leader" => Ok(None),
             Err(e) => Err(e),
-        }
-        .map_err(|e| anyhow!(e))?;
+        }?;
 
-        Ok(leader.and_then(|mut leader| {
+        Ok(leader.map(|mut leader| {
             let leader_kv = leader.take_kv().unwrap();
 
-            Some(MetaLeaderInfo {
+            MetaLeaderInfo {
                 node_address: String::from_utf8_lossy(leader_kv.value()).to_string(),
                 lease_id: leader_kv.lease() as u64,
-            })
+            }
         }))
     }
 
-    async fn campaign(&self, ttl: i64) -> MetaResult<()> {
+    async fn run_once(&self, ttl: i64) -> MetaResult<()> {
         let mut lease_client = self.client.lease_client();
         let mut election_client = self.client.election_client();
 
+        self.is_leader.store(false, Ordering::Relaxed);
+
         let leader_resp = election_client.leader(META_ELECTION_KEY).await;
 
-        let lease_id = match leader_resp.map(|mut resp| resp.take_kv()) {
+        let mut lease_id = match leader_resp.map(|mut resp| resp.take_kv()) {
             // leader exists
             Ok(Some(leader_kv)) if leader_kv.value() == self.id.as_bytes() => Ok(leader_kv.lease()),
 
@@ -104,8 +99,19 @@ impl ElectionClient for EtcdElectionClient {
 
             // connection error
             Err(e) => Err(e),
+        }?;
+
+        // try keep alive
+        let (mut keeper, mut resp_stream) = lease_client.keep_alive(lease_id).await.unwrap();
+        let _resp = keeper.keep_alive().await?;
+        let resp = resp_stream.message().await?;
+        if let Some(resp) = resp {
+            if resp.ttl() == 0 {
+                println!("lease id expired");
+                // renew lease_id
+                lease_id = lease_client.grant(ttl, None).await.map(|resp| resp.id())?;
+            }
         }
-        .map_err(|e| anyhow!(e))?;
 
         let (keep_alive_fail_tx, keep_alive_fail_rx) = oneshot::channel();
 
@@ -138,8 +144,7 @@ impl ElectionClient for EtcdElectionClient {
 
         let resp = election_client
             .campaign(META_ELECTION_KEY, self.id.as_bytes().to_vec(), lease_id)
-            .await
-            .map_err(|e| anyhow!(e))?;
+            .await?;
 
         println!(
             "id {} wins election {}",
@@ -164,17 +169,16 @@ impl EtcdElectionClient {
         endpoints: Vec<String>,
         options: Option<ConnectOptions>,
         auth_enabled: bool,
+        id: String,
     ) -> MetaResult<Self> {
         assert!(!auth_enabled, "auth not supported");
 
-        let client = Client::connect(&endpoints, options.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let client = Client::connect(&endpoints, options.clone()).await?;
 
         Ok(Self {
             client,
-            is_leader: Default::default(),
-            id: "".to_string(),
+            is_leader: AtomicBool::new(false),
+            id,
         })
     }
 }

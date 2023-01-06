@@ -33,8 +33,6 @@
 #![cfg_attr(coverage, feature(no_coverage))]
 #![test_runner(risingwave_test_runner::test_runner::run_failpont_tests)]
 
-extern crate core;
-
 pub mod backup_restore;
 mod barrier;
 #[cfg(not(madsim))] // no need in simulation test
@@ -165,7 +163,7 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
             dashboard_addr,
             ui_path: opts.dashboard_ui_path,
         };
-        let (join_handle, _shutdown_send) = rpc_serve(
+        let (join_handle, leader_lost_handle, _shutdown_send) = rpc_serve(
             add_info,
             backend,
             max_heartbeat_interval,
@@ -194,6 +192,14 @@ pub fn start(opts: MetaNodeOpts) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         )
         .await
         .unwrap();
-        join_handle.await.unwrap();
+
+        if let Some(leader_lost_handle) = leader_lost_handle {
+            tokio::select! {
+                _ = join_handle => {},
+                _ = leader_lost_handle => {},
+            }
+        } else {
+            join_handle.await.unwrap();
+        }
     })
 }

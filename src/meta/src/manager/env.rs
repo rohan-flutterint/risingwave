@@ -15,7 +15,6 @@
 use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
-use etcd_client::ElectionClient;
 
 #[cfg(any(test, feature = "test"))]
 use prost::Message;
@@ -30,7 +29,6 @@ use crate::manager::{
 };
 #[cfg(any(test, feature = "test"))]
 use crate::rpc::{META_CF_NAME, META_LEADER_KEY, META_LEASE_KEY};
-use crate::rpc::server::ElectionClientRef;
 #[cfg(any(test, feature = "test"))]
 use crate::storage::MemStore;
 use crate::storage::MetaStore;
@@ -57,7 +55,7 @@ where
     /// idle status manager.
     idle_manager: IdleManagerRef,
 
-    election_client: Option<ElectionClientRef>,
+    info: MetaLeaderInfo,
 
     /// options read by all services
     pub opts: Arc<MetaOpts>,
@@ -140,7 +138,7 @@ impl<S> MetaSrvEnv<S>
 where
     S: MetaStore,
 {
-    pub async fn new(opts: MetaOpts, meta_store: Arc<S>, election_client: Option<ElectionClientRef>) -> Self {
+    pub async fn new(opts: MetaOpts, meta_store: Arc<S>, info: MetaLeaderInfo) -> Self {
         // change to sync after refactor `IdGeneratorManager::new` sync.
         let id_gen_manager = Arc::new(IdGeneratorManager::new(meta_store.clone()).await);
         let stream_client_pool = Arc::new(StreamClientPool::default());
@@ -153,7 +151,7 @@ where
             notification_manager,
             stream_client_pool,
             idle_manager,
-            election_client,
+            info,
             opts: opts.into(),
         }
     }
@@ -199,11 +197,7 @@ where
     }
 
     pub fn get_leader_info(&self) -> MetaLeaderInfo {
-        if let Some(election_client) = self.election_client.as_ref() {
-            let leader = election_client.leader()
-        } else {
-            MetaLeaderInfo::default()
-        }
+        self.info.clone()
     }
 }
 
