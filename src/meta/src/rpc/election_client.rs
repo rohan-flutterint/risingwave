@@ -15,20 +15,21 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use etcd_client::{Client, ConnectOptions, Error};
+use etcd_client::{Client, ConnectOptions, Error, GetOptions};
 use risingwave_pb::meta::MetaLeaderInfo;
 use tokio::sync::oneshot;
 use tokio::time;
 use tokio_stream::StreamExt;
 
 use crate::MetaResult;
-const META_ELECTION_KEY: &str = "ELECTION";
+
+const META_ELECTION_KEY: &str = "__meta_election";
 
 #[async_trait::async_trait]
 pub trait ElectionClient: Send + Sync + 'static {
     async fn run_once(&self, ttl: i64) -> MetaResult<()>;
     async fn leader(&self) -> MetaResult<Option<MetaLeaderInfo>>;
-    // async fn get_members(&self) -> MetaResult<Vec<(String, bool)>>;
+    async fn get_members(&self) -> MetaResult<Vec<(String, i64, bool)>>;
     fn is_leader(&self) -> bool;
 }
 
@@ -107,9 +108,10 @@ impl ElectionClient for EtcdElectionClient {
         let resp = resp_stream.message().await?;
         if let Some(resp) = resp {
             if resp.ttl() == 0 {
-                println!("lease id expired");
+                tracing::info!("lease {} expired or revoked, re-granting", lease_id);
                 // renew lease_id
                 lease_id = lease_client.grant(ttl, None).await.map(|resp| resp.id())?;
+                tracing::info!("lease {} re-granted", lease_id);
             }
         }
 
@@ -126,28 +128,28 @@ impl ElectionClient for EtcdElectionClient {
                 ticker.tick().await;
                 let resp = keeper.keep_alive().await;
                 if let Err(err) = resp {
-                    println!("keep alive failed {}", err);
+                    tracing::error!("keep alive for lease {} failed {}", lease_id, err);
                     keep_alive_fail_tx.send(()).unwrap();
                     break;
                 }
 
                 if let Some(resp) = resp_stream.message().await.unwrap() {
                     if resp.ttl() <= 0 {
+                        tracing::warn!("lease expired or revoked {}", lease_id);
                         keep_alive_fail_tx.send(()).unwrap();
                         break;
                     }
                 }
             }
-
-            println!("keep alive loop for lease {} stopped", lease_id);
+            tracing::info!("keep alive loop for lease {} stopped", lease_id);
         });
 
         let resp = election_client
             .campaign(META_ELECTION_KEY, self.id.as_bytes().to_vec(), lease_id)
             .await?;
 
-        println!(
-            "id {} wins election {}",
+        tracing::info!(
+            "client {} wins election {}",
             self.id,
             resp.leader().unwrap().name_str().unwrap()
         );
@@ -156,23 +158,47 @@ impl ElectionClient for EtcdElectionClient {
 
         let _keep_alive_resp = keep_alive_fail_rx.await;
 
+        tracing::warn!("client {} lost leadership", self.id);
+
         self.is_leader.store(false, Ordering::Relaxed);
 
         handle.abort();
 
         Ok(())
     }
+
+    async fn get_members(&self) -> MetaResult<Vec<(String, i64, bool)>> {
+        let mut client = self.client.kv_client();
+        let keys = client
+            .get(META_ELECTION_KEY, Some(GetOptions::new().with_prefix()))
+            .await?;
+        let mut kvs = keys.kvs().to_vec();
+
+        kvs.sort_by(|a, b| {
+            a.create_revision()
+                .partial_cmp(&b.create_revision())
+                .unwrap()
+        });
+
+        Ok(kvs
+            .into_iter()
+            .enumerate()
+            .map(|(i, kv)| {
+                (
+                    String::from_utf8_lossy(kv.value()).to_string(),
+                    kv.lease(),
+                    i == 0,
+                )
+            })
+            .collect())
+    }
 }
 impl EtcdElectionClient {
-    #[allow(dead_code)]
     pub(crate) async fn new(
         endpoints: Vec<String>,
         options: Option<ConnectOptions>,
-        auth_enabled: bool,
         id: String,
     ) -> MetaResult<Self> {
-        assert!(!auth_enabled, "auth not supported");
-
         let client = Client::connect(&endpoints, options.clone()).await?;
 
         Ok(Self {

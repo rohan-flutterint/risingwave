@@ -93,7 +93,6 @@ pub async fn rpc_serve(
                 EtcdElectionClient::new(
                     endpoints,
                     Some(options),
-                    false,
                     address_info.listen_addr.clone().to_string(),
                 )
                 .await?,

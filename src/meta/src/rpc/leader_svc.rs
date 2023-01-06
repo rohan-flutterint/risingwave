@@ -58,12 +58,6 @@ use crate::storage::MetaStore;
 use crate::stream::{GlobalStreamManager, SourceManager};
 use crate::{hummock, MetaResult};
 
-// simple wrapper containing election sync related objects
-pub struct ElectionCoordination {
-    pub election_handle: JoinHandle<()>,
-    pub election_shutdown: OneSender<()>,
-}
-
 /// Starts all services needed for the meta leader node
 /// Only call this function once, since initializing the services multiple times will result in an
 /// inconsistent state
