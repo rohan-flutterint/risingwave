@@ -30,7 +30,7 @@ use tokio::time;
 use super::follower_svc::start_follower_srv;
 use super::leader_svc::ElectionCoordination;
 use crate::manager::MetaOpts;
-use crate::rpc::election_client::{ElectionClient, ElectionContext, EtcdElectionClient};
+use crate::rpc::election_client::{ElectionClient, EtcdElectionClient};
 use crate::rpc::leader_svc::start_leader_srv;
 use crate::storage::{EtcdMetaStore, MemStore, MetaStore, WrappedEtcdClient as EtcdClient};
 use crate::MetaResult;
@@ -64,6 +64,9 @@ impl Default for AddressInfo {
         }
     }
 }
+
+
+pub type ElectionClientRef = Arc<dyn ElectionClient>;
 
 pub async fn rpc_serve(
     address_info: AddressInfo,
@@ -121,30 +124,42 @@ pub async fn rpc_serve(
     }
 }
 
-pub async fn rpc_serve_with_store2<S: MetaStore, C: ElectionClient + 'static>(
+pub async fn rpc_serve_with_store2<S: MetaStore>(
     meta_store: Arc<S>,
-    election_client: Option<Arc<C>>,
+    election_client: Option<ElectionClientRef>,
     address_info: AddressInfo,
     max_heartbeat_interval: Duration,
     lease_interval_secs: u64,
     opts: MetaOpts,
 ) -> MetaResult<(JoinHandle<()>, WatchSender<()>)> {
-    let (svc_shutdown_tx, svc_shutdown_rx) = watch::channel(());
+    let (svc_shutdown_tx, mut svc_shutdown_rx) = watch::channel(());
 
-    // if let Some(election_client) = election_client.clone() {
-    //     tokio::spawn(async move {
-    //
-    //         let e = election_client.clone();
-    //         while let Err(e) = e.campaign(lease_interval_secs as i64).await {
-    //             tracing::error!("election error happened")
-    //         }
-    //
-    //         exit(0);
-    //     });
-    // }
+    if let Some(election_client) = election_client.clone() {
+        let mut stop_rx = svc_shutdown_tx.subscribe();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_rx.changed() => {
+                        return;
+                    },
+
+                    resp = election_client.campaign(lease_interval_secs as i64) => {
+                        if let Err(e) = resp {
+                            tracing::error!("election error happened, {}", e.to_string());
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            panic!("leader lost!");
+        });
+    }
 
     let join_handle = tokio::spawn(async move {
-        if let Some(election_client) = election_client {
+        if let Some(election_client) = election_client.clone() {
             let svc_shutdown_rx_clone = svc_shutdown_rx.clone();
             let (follower_shutdown_tx, follower_shutdown_rx) = OneChannel::<()>();
             let follower_handle: Option<JoinHandle<()>> = if !election_client.is_leader() {
@@ -174,18 +189,12 @@ pub async fn rpc_serve_with_store2<S: MetaStore, C: ElectionClient + 'static>(
             }
         };
 
-        // let elect_coord = ElectionCoordination {
-        //     election_handle,
-        //     election_shutdown,
-        // };
-
         start_leader_srv(
             meta_store,
             address_info,
             max_heartbeat_interval,
             opts,
-            MetaLeaderInfo::default(),
-            //            elect_coord,
+            election_client.clone(),
             svc_shutdown_rx,
         )
         .await

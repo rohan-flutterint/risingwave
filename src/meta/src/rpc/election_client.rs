@@ -31,9 +31,10 @@ use crate::MetaResult;
 const META_ELECTION_KEY: &str = "ELECTION";
 
 #[async_trait::async_trait]
-pub trait ElectionClient: Send + Sync {
+pub trait ElectionClient: Send + Sync + 'static {
     async fn campaign(&self, ttl: i64) -> MetaResult<()>;
     async fn leader(&self) -> MetaResult<Option<MetaLeaderInfo>>;
+    //async fn get_members(&self) -> MetaResult<Vec<(String, bool)>>;
     fn is_leader(&self) -> bool;
 }
 
@@ -135,16 +136,10 @@ impl ElectionClient for EtcdElectionClient {
             println!("keep alive loop for lease {} stopped", lease_id);
         });
 
-        let resp = match election_client
+        let resp = election_client
             .campaign(META_ELECTION_KEY, self.id.as_bytes().to_vec(), lease_id)
             .await
-        {
-            Ok(resp) => Ok(resp),
-            Err(e) => {
-                handle.abort();
-                Err(anyhow!(e))
-            }
-        }?;
+            .map_err(|e| anyhow!(e))?;
 
         println!(
             "id {} wins election {}",

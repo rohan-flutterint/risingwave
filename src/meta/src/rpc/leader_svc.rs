@@ -47,7 +47,7 @@ use crate::manager::{
     CatalogManager, ClusterManager, FragmentManager, IdleManager, MetaOpts, MetaSrvEnv,
 };
 use crate::rpc::metrics::MetaMetrics;
-use crate::rpc::server::AddressInfo;
+use crate::rpc::server::{AddressInfo, ElectionClientRef};
 use crate::rpc::service::backup_service::BackupServiceImpl;
 use crate::rpc::service::cluster_service::ClusterServiceImpl;
 use crate::rpc::service::heartbeat_service::HeartbeatServiceImpl;
@@ -57,6 +57,7 @@ use crate::rpc::service::user_service::UserServiceImpl;
 use crate::storage::MetaStore;
 use crate::stream::{GlobalStreamManager, SourceManager};
 use crate::{hummock, MetaResult};
+use crate::rpc::election_client::ElectionClient;
 
 // simple wrapper containing election sync related objects
 pub struct ElectionCoordination {
@@ -70,18 +71,18 @@ pub struct ElectionCoordination {
 ///
 /// ## Returns
 /// Returns an error if the service initialization failed
-pub async fn start_leader_srv<S: MetaStore>(
+pub async fn start_leader_srv<S: MetaStore >(
     meta_store: Arc<S>,
     address_info: AddressInfo,
     max_heartbeat_interval: Duration,
     opts: MetaOpts,
-    current_leader: MetaLeaderInfo,
-    //election_coordination: ElectionCoordination,
+    election_client: Option<ElectionClientRef>,
     mut svc_shutdown_rx: WatchReceiver<()>,
 ) -> MetaResult<()> {
+    let current_leader = MetaLeaderInfo::default();
     tracing::info!("Defining leader services");
     let prometheus_endpoint = opts.prometheus_endpoint.clone();
-    let env = MetaSrvEnv::<S>::new(opts, meta_store.clone(), current_leader).await;
+    let env = MetaSrvEnv::<S>::new(opts, meta_store.clone(), election_client).await;
     let fragment_manager = Arc::new(FragmentManager::new(env.clone()).await.unwrap());
     let meta_metrics = Arc::new(MetaMetrics::new());
     let registry = meta_metrics.registry();
@@ -106,8 +107,8 @@ pub async fn start_leader_srv<S: MetaStore>(
         meta_metrics.clone(),
         compactor_manager.clone(),
     )
-    .await
-    .unwrap();
+        .await
+        .unwrap();
 
     #[cfg(not(madsim))]
     if let Some(ref dashboard_addr) = address_info.dashboard_addr {
@@ -138,8 +139,8 @@ pub async fn start_leader_srv<S: MetaStore>(
             catalog_manager.clone(),
             fragment_manager.clone(),
         )
-        .await
-        .unwrap(),
+            .await
+            .unwrap(),
     );
 
     let barrier_manager = Arc::new(GlobalBarrierManager::new(
@@ -169,7 +170,7 @@ pub async fn start_leader_srv<S: MetaStore>(
             source_manager.clone(),
             hummock_manager.clone(),
         )
-        .unwrap(),
+            .unwrap(),
     );
 
     hummock_manager
@@ -190,14 +191,14 @@ pub async fn start_leader_srv<S: MetaStore>(
             true,
             "Meta Backup",
         )
-        .await,
+            .await,
     );
     let backup_storage = Arc::new(
         ObjectStoreMetaSnapshotStorage::new(
             &env.opts.backup_storage_directory,
             backup_object_store,
         )
-        .await?,
+            .await?,
     );
     let backup_manager = Arc::new(BackupManager::new(
         env.clone(),
@@ -278,7 +279,7 @@ pub async fn start_leader_srv<S: MetaStore>(
             Duration::from_secs(env.opts.node_num_monitor_interval_sec),
             meta_metrics.clone(),
         )
-        .await,
+            .await,
     );
     sub_tasks.push(HummockManager::start_compaction_heartbeat(hummock_manager).await);
     // sub_tasks.push((
