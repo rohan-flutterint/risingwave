@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::BorrowMut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use etcd_client::{Client, ConnectOptions, Error, GetOptions};
 use risingwave_pb::meta::MetaLeaderInfo;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time;
 use tokio_stream::StreamExt;
 
@@ -27,10 +28,10 @@ const META_ELECTION_KEY: &str = "__meta_election";
 
 #[async_trait::async_trait]
 pub trait ElectionClient: Send + Sync + 'static {
-    async fn run_once(&self, ttl: i64) -> MetaResult<()>;
+    async fn run_once(&self, ttl: i64, stop: watch::Receiver<()>) -> MetaResult<()>;
     async fn leader(&self) -> MetaResult<Option<MetaLeaderInfo>>;
     async fn get_members(&self) -> MetaResult<Vec<(String, i64, bool)>>;
-    fn is_leader(&self) -> bool;
+    async fn is_leader(&self) -> bool;
 }
 
 pub struct EtcdElectionClient {
@@ -39,20 +40,14 @@ pub struct EtcdElectionClient {
     pub id: String,
 }
 
-impl EtcdElectionClient {
-    fn value_to_address(value: &[u8]) -> String {
-        String::from_utf8_lossy(value).to_string()
-    }
-}
-
 #[async_trait::async_trait]
 impl ElectionClient for EtcdElectionClient {
-    fn is_leader(&self) -> bool {
+    async fn is_leader(&self) -> bool {
         self.is_leader.load(Ordering::Relaxed)
     }
 
     async fn leader(&self) -> MetaResult<Option<MetaLeaderInfo>> {
-        if self.is_leader.load(Ordering::Relaxed) {
+        if self.is_leader().await {
             return Ok(Some(MetaLeaderInfo {
                 node_address: self.id.clone(),
                 lease_id: 0,
@@ -78,9 +73,10 @@ impl ElectionClient for EtcdElectionClient {
         }))
     }
 
-    async fn run_once(&self, ttl: i64) -> MetaResult<()> {
+    async fn run_once(&self, ttl: i64, stop: watch::Receiver<()>) -> MetaResult<()> {
         let mut lease_client = self.client.lease_client();
         let mut election_client = self.client.election_client();
+        let mut stop = stop;
 
         self.is_leader.store(false, Ordering::Relaxed);
 
@@ -115,9 +111,11 @@ impl ElectionClient for EtcdElectionClient {
             }
         }
 
-        let (keep_alive_fail_tx, keep_alive_fail_rx) = oneshot::channel();
+        let (keep_alive_fail_tx, mut keep_alive_fail_rx) = oneshot::channel();
 
         let mut lease_client = self.client.lease_client();
+
+        let mut stop_ = stop.clone();
 
         let handle = tokio::spawn(async move {
             let (mut keeper, mut resp_stream) = lease_client.keep_alive(lease_id).await.unwrap();
@@ -125,18 +123,28 @@ impl ElectionClient for EtcdElectionClient {
             let mut ticker = time::interval(Duration::from_secs(1));
 
             loop {
-                ticker.tick().await;
-                let resp = keeper.keep_alive().await;
-                if let Err(err) = resp {
-                    tracing::error!("keep alive for lease {} failed {}", lease_id, err);
-                    keep_alive_fail_tx.send(()).unwrap();
-                    break;
-                }
+                tokio::select! {
+                    biased;
 
-                if let Some(resp) = resp_stream.message().await.unwrap() {
-                    if resp.ttl() <= 0 {
-                        tracing::warn!("lease expired or revoked {}", lease_id);
-                        keep_alive_fail_tx.send(()).unwrap();
+                    _ = ticker.tick() => {
+                        let resp = keeper.keep_alive().await;
+                        if let Err(err) = resp {
+                            tracing::error!("keep alive for lease {} failed {}", lease_id, err);
+                            keep_alive_fail_tx.send(()).unwrap();
+                            break;
+                        }
+
+                        if let Some(resp) = resp_stream.message().await.unwrap() {
+                            if resp.ttl() <= 0 {
+                                tracing::warn!("lease expired or revoked {}", lease_id);
+                                keep_alive_fail_tx.send(()).unwrap();
+                                break;
+                            }
+                        }
+                    }
+
+                    _ = stop_.changed() => {
+                        tracing::info!("stop signal received");
                         break;
                     }
                 }
@@ -144,19 +152,52 @@ impl ElectionClient for EtcdElectionClient {
             tracing::info!("keep alive loop for lease {} stopped", lease_id);
         });
 
-        let resp = election_client
-            .campaign(META_ELECTION_KEY, self.id.as_bytes().to_vec(), lease_id)
-            .await?;
+        tokio::select! {
+            biased;
 
-        tracing::info!(
-            "client {} wins election {}",
-            self.id,
-            resp.leader().unwrap().name_str().unwrap()
-        );
+            _ = stop.changed() => {
+                tracing::info!("stop signal received");
+                return Ok(());
+            }
+
+            _ = election_client.campaign(META_ELECTION_KEY, self.id.as_bytes().to_vec(), lease_id) => {
+                tracing::info!("client {} wins election {}", self.id, META_ELECTION_KEY);
+            }
+        };
+
+        // todo, better way to defer(handle.abort)
+        let mut observe_stream = election_client.observe(META_ELECTION_KEY).await?;
 
         self.is_leader.store(true, Ordering::Relaxed);
 
-        let _keep_alive_resp = keep_alive_fail_rx.await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = stop.changed() => {
+                    tracing::info!("stop signal received");
+                    break;
+                },
+                _ = keep_alive_fail_rx.borrow_mut() => {
+                    tracing::error!("keep alive failed, stopping main loop");
+                    break;
+                },
+                resp = observe_stream.next() => {
+                    match resp {
+                        None => unreachable!(),
+                        Some(Ok(leader)) => {
+                            if let Some(kv) = leader.kv() && kv.value() != self.id.as_bytes() {
+                                tracing::warn!("leader has been changed to {}", String::from_utf8_lossy(kv.value()).to_string());
+                                break;
+                            }
+                        }
+                        Some(Err(e)) => {
+                            tracing::error!("error {} received from leader observe stream", e.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
 
         tracing::warn!("client {} lost leadership", self.id);
 
@@ -193,6 +234,7 @@ impl ElectionClient for EtcdElectionClient {
             .collect())
     }
 }
+
 impl EtcdElectionClient {
     pub(crate) async fn new(
         endpoints: Vec<String>,

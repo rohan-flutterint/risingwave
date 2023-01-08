@@ -23,7 +23,6 @@ use arc_swap::ArcSwap;
 use fail::fail_point;
 use function_name::named;
 use itertools::Itertools;
-use prost::Message;
 use risingwave_common::monitor::rwlock::MonitoredRwLock;
 use risingwave_common::util::epoch::{Epoch, INVALID_EPOCH};
 use risingwave_hummock_sdk::compact::compact_task_to_string;

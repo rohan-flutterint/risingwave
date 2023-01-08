@@ -31,9 +31,7 @@ use risingwave_pb::meta::scale_service_server::ScaleServiceServer;
 use risingwave_pb::meta::stream_manager_service_server::StreamManagerServiceServer;
 use risingwave_pb::meta::MetaLeaderInfo;
 use risingwave_pb::user::user_service_server::UserServiceServer;
-use tokio::sync::oneshot::Sender as OneSender;
 use tokio::sync::watch::Receiver as WatchReceiver;
-use tokio::task::JoinHandle;
 
 use super::intercept::MetricsMiddlewareLayer;
 use super::service::health_service::HealthServiceImpl;
