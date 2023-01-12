@@ -36,6 +36,11 @@ fn not_unique_error(db_error: &str) -> bool {
     db_error.contains("Bind error") && db_error.contains("is not unique")
 }
 
+// Do not support streaming nested-loop join, it is expensive.
+fn is_nested_loop_join_error(db_error: &str) -> bool {
+    db_error.contains("Not supported: streaming nested-loop join")
+}
+
 /// Certain errors are permitted to occur. This is because:
 /// 1. It is more complex to generate queries without these errors.
 /// 2. These errors seldom occur, skipping them won't affect overall effectiveness of sqlsmith.
@@ -44,4 +49,5 @@ pub fn is_permissible_error(db_error: &str) -> bool {
         || is_division_by_zero_err(db_error)
         || is_unimplemented_error(db_error)
         || not_unique_error(db_error)
+        || is_nested_loop_join_error(db_error)
 }
