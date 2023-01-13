@@ -919,14 +919,14 @@ impl GrpcMetaClient {
         }
 
         tokio::spawn(async move {
-            let member_map = member_map;
+            let mut member_map = member_map;
             let mut leader_address = leader_address;
 
             let mut ticker = time::interval(Duration::from_secs(1));
             loop {
                 ticker.tick().await;
 
-                let mut guard = core.lock().await;
+                let mut leader_switched = false;
 
                 for (addr, client) in &member_map {
                     match client.to_owned().leader(LeaderRequest {}).await {
@@ -947,8 +947,10 @@ impl GrpcMetaClient {
                                         Ok(channel) => channel,
                                     };
 
+                                    let mut guard = core.lock().await;
                                     *guard = Self::generate_core(channel);
 
+                                    leader_switched = true;
                                     leader_address = discovered_leader_address.clone();
                                 }
 
@@ -959,6 +961,39 @@ impl GrpcMetaClient {
                             tracing::warn!("failed to fetch leader from {}, {}", addr, e);
                         }
                     }
+                }
+
+                if leader_switched {
+                    let MembersResponse { members } = {
+                        let guard = core.lock().await;
+                        match guard
+                            .election_client
+                            .to_owned()
+                            .members(MembersRequest {})
+                            .await
+                        {
+                            Ok(resp) => resp.into_inner(),
+                            Err(_e) => continue,
+                        }
+                    };
+
+                    let mut new_member_map = HashMap::new();
+
+                    for member in members {
+                        if let Some(member_addr) = member.member_addr {
+                            let addr = format!("http://{}:{}", member_addr.host, member_addr.port);
+
+                            if let Some(client) = member_map.remove(&addr) {
+                                new_member_map.insert(addr, client);
+                            } else {
+                                let channel = Self::build_rpc_channel(&addr).await.expect("todo");
+
+                                new_member_map.insert(addr, LeaderServiceClient::new(channel));
+                            }
+                        }
+                    }
+
+                    member_map = new_member_map;
                 }
             }
         });
