@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -41,6 +42,8 @@ use risingwave_pb::ddl_service::*;
 use risingwave_pb::hummock::hummock_manager_service_client::HummockManagerServiceClient;
 use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::mutable_config::MutableConfig;
 use risingwave_pb::hummock::*;
+use risingwave_pb::leader::leader_service_client::LeaderServiceClient;
+use risingwave_pb::leader::{LeaderRequest, MembersRequest, MembersResponse};
 use risingwave_pb::meta::cluster_service_client::ClusterServiceClient;
 use risingwave_pb::meta::heartbeat_request::{extra_info, ExtraInfo};
 use risingwave_pb::meta::heartbeat_service_client::HeartbeatServiceClient;
@@ -55,14 +58,16 @@ use risingwave_pb::user::update_user_request::UpdateField;
 use risingwave_pb::user::user_service_client::UserServiceClient;
 use risingwave_pb::user::*;
 use tokio::sync::oneshot::Sender;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tokio::time;
 use tokio_retry::strategy::{jitter, ExponentialBackoff};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Streaming;
 
 use crate::error::Result;
 use crate::hummock_meta_client::{CompactTaskItem, HummockMetaClient};
-use crate::{rpc_client_method_impl, ExtraInfoSourceRef};
+use crate::{meta_rpc_client_method_impl, ExtraInfoSourceRef};
 
 type DatabaseId = u32;
 type SchemaId = u32;
@@ -115,6 +120,7 @@ impl MetaClient {
         worker_node_parallelism: usize,
     ) -> Result<Self> {
         let grpc_meta_client = GrpcMetaClient::new(meta_addr).await?;
+        grpc_meta_client.tick_loop(meta_addr).await?;
         let request = AddWorkerNodeRequest {
             worker_type: worker_type as i32,
             host: Some(addr.to_protobuf()),
@@ -851,12 +857,10 @@ impl HummockMetaClient for MetaClient {
     }
 }
 
-/// Client to meta server. Cloning the instance is lightweight.
-///
-/// It is a wrapper of tonic client. See [`rpc_client_method_impl`].
 #[derive(Debug, Clone)]
-struct GrpcMetaClient {
+struct GrpcMetaClientCore {
     cluster_client: ClusterServiceClient<Channel>,
+    election_client: LeaderServiceClient<Channel>,
     heartbeat_client: HeartbeatServiceClient<Channel>,
     ddl_client: DdlServiceClient<Channel>,
     hummock_client: HummockManagerServiceClient<Channel>,
@@ -865,6 +869,14 @@ struct GrpcMetaClient {
     user_client: UserServiceClient<Channel>,
     scale_client: ScaleServiceClient<Channel>,
     backup_client: BackupServiceClient<Channel>,
+}
+
+/// Client to meta server. Cloning the instance is lightweight.
+///
+/// It is a wrapper of tonic client. See [`rpc_client_method_impl`].
+#[derive(Debug, Clone)]
+struct GrpcMetaClient {
+    core: Arc<Mutex<GrpcMetaClientCore>>,
 }
 
 impl GrpcMetaClient {
@@ -883,8 +895,111 @@ impl GrpcMetaClient {
     // Max retry interval in ms for request to meta server.
     const REQUEST_RETRY_MAX_INTERVAL_MS: u64 = 5000;
 
+    async fn tick_loop(&self, addr: &str) -> Result<()> {
+        let core = self.core.clone();
+
+        let leader_address = addr.to_string();
+
+        let MembersResponse { members } = core
+            .lock()
+            .await
+            .election_client
+            .members(MembersRequest {})
+            .await?
+            .into_inner();
+
+        let mut member_map = HashMap::new();
+
+        for member in members {
+            if let Some(member_addr) = member.member_addr {
+                let addr = format!("http://{}:{}", member_addr.host, member_addr.port);
+                let channel = Self::build_rpc_channel(&addr).await?;
+                member_map.insert(addr, LeaderServiceClient::new(channel));
+            }
+        }
+
+        tokio::spawn(async move {
+            let member_map = member_map;
+            let mut leader_address = leader_address;
+
+            let mut ticker = time::interval(Duration::from_secs(1));
+            loop {
+                ticker.tick().await;
+
+                let mut guard = core.lock().await;
+
+                for (addr, client) in &member_map {
+                    match client.to_owned().leader(LeaderRequest {}).await {
+                        Ok(resp) => {
+                            if let Some(leader) = resp.into_inner().leader_addr {
+                                let discovered_leader_address =
+                                    format!("http://{}:{}", leader.host, leader.port);
+
+                                if leader_address != discovered_leader_address {
+                                    tracing::info!("new leader {}", discovered_leader_address);
+
+                                    let channel = match Self::build_rpc_channel(
+                                        discovered_leader_address.as_str(),
+                                    )
+                                    .await
+                                    {
+                                        Err(_e) => continue,
+                                        Ok(channel) => channel,
+                                    };
+
+                                    *guard = Self::generate_core(channel);
+
+                                    leader_address = discovered_leader_address.clone();
+                                }
+
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("failed to fetch leader from {}, {}", addr, e);
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     /// Connect to the meta server `addr`.
     pub async fn new(addr: &str) -> Result<Self> {
+        let channel = Self::build_rpc_channel(addr).await?;
+        Ok(Self {
+            core: Arc::new(Mutex::new(Self::generate_core(channel))),
+        })
+    }
+
+    fn generate_core(channel: Channel) -> GrpcMetaClientCore {
+        let cluster_client = ClusterServiceClient::new(channel.clone());
+        let election_client = LeaderServiceClient::new(channel.clone());
+        let heartbeat_client = HeartbeatServiceClient::new(channel.clone());
+        let ddl_client = DdlServiceClient::new(channel.clone());
+        let hummock_client = HummockManagerServiceClient::new(channel.clone());
+        let notification_client = NotificationServiceClient::new(channel.clone());
+        let stream_client = StreamManagerServiceClient::new(channel.clone());
+        let user_client = UserServiceClient::new(channel.clone());
+        let scale_client = ScaleServiceClient::new(channel.clone());
+        let backup_client = BackupServiceClient::new(channel);
+        GrpcMetaClientCore {
+            cluster_client,
+            election_client,
+            heartbeat_client,
+            ddl_client,
+            hummock_client,
+            notification_client,
+            stream_client,
+            user_client,
+            scale_client,
+            backup_client,
+        }
+    }
+
+    async fn build_rpc_channel(addr: &str) -> Result<Channel> {
         let endpoint = Endpoint::from_shared(addr.to_string())?
             .initial_connection_window_size(MAX_CONNECTION_WINDOW_SIZE);
         let retry_strategy = ExponentialBackoff::from_millis(Self::CONN_RETRY_BASE_INTERVAL_MS)
@@ -910,26 +1025,7 @@ impl GrpcMetaClient {
         })
         .await?;
 
-        let cluster_client = ClusterServiceClient::new(channel.clone());
-        let heartbeat_client = HeartbeatServiceClient::new(channel.clone());
-        let ddl_client = DdlServiceClient::new(channel.clone());
-        let hummock_client = HummockManagerServiceClient::new(channel.clone());
-        let notification_client = NotificationServiceClient::new(channel.clone());
-        let stream_client = StreamManagerServiceClient::new(channel.clone());
-        let user_client = UserServiceClient::new(channel.clone());
-        let scale_client = ScaleServiceClient::new(channel.clone());
-        let backup_client = BackupServiceClient::new(channel);
-        Ok(Self {
-            cluster_client,
-            heartbeat_client,
-            ddl_client,
-            hummock_client,
-            notification_client,
-            stream_client,
-            user_client,
-            scale_client,
-            backup_client,
-        })
+        Ok(channel)
     }
 
     /// Return retry strategy for retrying meta requests.
@@ -1016,5 +1112,5 @@ macro_rules! for_all_meta_rpc {
 }
 
 impl GrpcMetaClient {
-    for_all_meta_rpc! { rpc_client_method_impl }
+    for_all_meta_rpc! { meta_rpc_client_method_impl }
 }
