@@ -17,6 +17,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::anyhow;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use risingwave_common::catalog::{CatalogVersion, FunctionId, IndexId, TableId};
@@ -35,7 +36,7 @@ use risingwave_pb::catalog::{
     Schema as ProstSchema, Sink as ProstSink, Source as ProstSource, Table as ProstTable,
     View as ProstView,
 };
-use risingwave_pb::common::WorkerType;
+use risingwave_pb::common::{HostAddress, WorkerType};
 use risingwave_pb::ddl_service::ddl_service_client::DdlServiceClient;
 use risingwave_pb::ddl_service::drop_table_request::SourceId;
 use risingwave_pb::ddl_service::*;
@@ -43,7 +44,7 @@ use risingwave_pb::hummock::hummock_manager_service_client::HummockManagerServic
 use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::mutable_config::MutableConfig;
 use risingwave_pb::hummock::*;
 use risingwave_pb::leader::leader_service_client::LeaderServiceClient;
-use risingwave_pb::leader::{LeaderRequest, MembersRequest, MembersResponse};
+use risingwave_pb::leader::{LeaderRequest, LeaderResponse, MembersRequest, MembersResponse};
 use risingwave_pb::meta::cluster_service_client::ClusterServiceClient;
 use risingwave_pb::meta::heartbeat_request::{extra_info, ExtraInfo};
 use risingwave_pb::meta::heartbeat_service_client::HeartbeatServiceClient;
@@ -63,9 +64,9 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_retry::strategy::{jitter, ExponentialBackoff};
 use tonic::transport::{Channel, Endpoint};
-use tonic::Streaming;
+use tonic::{Response, Status, Streaming};
 
-use crate::error::Result;
+use crate::error::{Result, RpcError};
 use crate::hummock_meta_client::{CompactTaskItem, HummockMetaClient};
 use crate::{meta_rpc_client_method_impl, ExtraInfoSourceRef};
 
@@ -871,6 +872,33 @@ struct GrpcMetaClientCore {
     backup_client: BackupServiceClient<Channel>,
 }
 
+impl GrpcMetaClientCore {
+    pub(crate) fn new(channel: Channel) -> Self {
+        let cluster_client = ClusterServiceClient::new(channel.clone());
+        let election_client = LeaderServiceClient::new(channel.clone());
+        let heartbeat_client = HeartbeatServiceClient::new(channel.clone());
+        let ddl_client = DdlServiceClient::new(channel.clone());
+        let hummock_client = HummockManagerServiceClient::new(channel.clone());
+        let notification_client = NotificationServiceClient::new(channel.clone());
+        let stream_client = StreamManagerServiceClient::new(channel.clone());
+        let user_client = UserServiceClient::new(channel.clone());
+        let scale_client = ScaleServiceClient::new(channel.clone());
+        let backup_client = BackupServiceClient::new(channel);
+        GrpcMetaClientCore {
+            cluster_client,
+            election_client,
+            heartbeat_client,
+            ddl_client,
+            hummock_client,
+            notification_client,
+            stream_client,
+            user_client,
+            scale_client,
+            backup_client,
+        }
+    }
+}
+
 /// Client to meta server. Cloning the instance is lightweight.
 ///
 /// It is a wrapper of tonic client. See [`rpc_client_method_impl`].
@@ -918,83 +946,101 @@ impl GrpcMetaClient {
             }
         }
 
-        tokio::spawn(async move {
-            let mut member_map = member_map;
-            let mut leader_address = leader_address;
+        struct MemberManagement {
+            core_ref: Arc<Mutex<GrpcMetaClientCore>>,
+            members: HashMap<String, LeaderServiceClient<Channel>>,
+            current_leader: String,
+        }
 
-            let mut ticker = time::interval(Duration::from_secs(1));
-            loop {
-                ticker.tick().await;
+        impl MemberManagement {
+            fn host_address_to_url(addr: &HostAddress) -> String {
+                format!("http://{}:{}", addr.host, addr.port)
+            }
 
-                let mut leader_switched = false;
+            async fn recreate_core(&mut self, channel: Channel) {
+                let mut core = self.core_ref.lock().await;
+                *core = GrpcMetaClientCore::new(channel);
+            }
 
-                for (addr, client) in &member_map {
-                    match client.to_owned().leader(LeaderRequest {}).await {
-                        Ok(resp) => {
-                            if let Some(leader) = resp.into_inner().leader_addr {
-                                let discovered_leader_address =
-                                    format!("http://{}:{}", leader.host, leader.port);
-
-                                if leader_address != discovered_leader_address {
-                                    tracing::info!("new leader {}", discovered_leader_address);
-
-                                    let channel = match Self::build_rpc_channel(
-                                        discovered_leader_address.as_str(),
-                                    )
-                                    .await
-                                    {
-                                        Err(_e) => continue,
-                                        Ok(channel) => channel,
-                                    };
-
-                                    let mut guard = core.lock().await;
-                                    *guard = Self::generate_core(channel);
-
-                                    leader_switched = true;
-                                    leader_address = discovered_leader_address.clone();
-                                }
-
-                                break;
-                            }
-                        }
+            async fn tick_update_members(&mut self) -> Result<()> {
+                let members = None;
+                for (addr, client) in &self.members {
+                    let members_resp = match client.to_owned().members(MembersRequest {}).await {
+                        Ok(resp) => resp.into_inner(),
                         Err(e) => {
-                            tracing::warn!("failed to fetch leader from {}, {}", addr, e);
-                        }
-                    }
-                }
-
-                if leader_switched {
-                    let MembersResponse { members } = {
-                        let guard = core.lock().await;
-                        match guard
-                            .election_client
-                            .to_owned()
-                            .members(MembersRequest {})
-                            .await
-                        {
-                            Ok(resp) => resp.into_inner(),
-                            Err(_e) => continue,
+                            tracing::warn!("failed to fetch members from {}, {}", addr, e);
+                            continue;
                         }
                     };
 
-                    let mut new_member_map = HashMap::new();
+                    let members = members_resp.members;
 
-                    for member in members {
-                        if let Some(member_addr) = member.member_addr {
-                            let addr = format!("http://{}:{}", member_addr.host, member_addr.port);
+                    let member_addrs = members
+                        .into_iter()
+                        .flat_map(|member| member.member_addr)
+                        .map(|addr| Self::host_address_to_url(&addr))
+                        .sorted()
+                        .dedup()
+                        .collect_vec();
 
-                            if let Some(client) = member_map.remove(&addr) {
-                                new_member_map.insert(addr, client);
-                            } else {
-                                let channel = Self::build_rpc_channel(&addr).await.expect("todo");
-
-                                new_member_map.insert(addr, LeaderServiceClient::new(channel));
-                            }
-                        }
-                    }
-
-                    member_map = new_member_map;
+                    break;
                 }
+
+                todo!()
+            }
+
+            async fn tick_check_leader(&mut self) -> Result<()> {
+                for (addr, client) in &self.members {
+                    let leader_resp = match client.to_owned().leader(LeaderRequest {}).await {
+                        Ok(resp) => resp.into_inner(),
+                        Err(e) => {
+                            tracing::warn!("failed to fetch leader from {}, {}", addr, e);
+                            continue;
+                        }
+                    };
+
+                    if let Some(leader_addr) = &leader_resp.leader_addr {
+                        let discovered_leader = Self::host_address_to_url(leader_addr);
+
+                        if discovered_leader != self.current_leader {
+                            tracing::info!("new meta leader {} discovered", discovered_leader);
+                            let channel =
+                                GrpcMetaClient::build_rpc_channel(discovered_leader.as_str())
+                                    .await?;
+
+                            self.recreate_core(channel).await;
+                            self.current_leader = discovered_leader;
+                        }
+
+                        return Ok(());
+                    }
+                }
+
+                return Err(RpcError::Internal(anyhow!(
+                    "could not ensure meta node leader"
+                )));
+            }
+
+            async fn tick(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let member_management = MemberManagement {
+            core_ref: core,
+            members: member_map,
+            current_leader: leader_address,
+        };
+
+        tokio::spawn(async move {
+            let mut member_management = member_management;
+            let mut ticker = time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                }
+
+                if let Err(e) = member_management.tick().await {}
             }
         });
 
@@ -1005,36 +1051,11 @@ impl GrpcMetaClient {
     pub async fn new(addr: &str) -> Result<Self> {
         let channel = Self::build_rpc_channel(addr).await?;
         Ok(Self {
-            core: Arc::new(Mutex::new(Self::generate_core(channel))),
+            core: Arc::new(Mutex::new(GrpcMetaClientCore::new(channel))),
         })
     }
 
-    fn generate_core(channel: Channel) -> GrpcMetaClientCore {
-        let cluster_client = ClusterServiceClient::new(channel.clone());
-        let election_client = LeaderServiceClient::new(channel.clone());
-        let heartbeat_client = HeartbeatServiceClient::new(channel.clone());
-        let ddl_client = DdlServiceClient::new(channel.clone());
-        let hummock_client = HummockManagerServiceClient::new(channel.clone());
-        let notification_client = NotificationServiceClient::new(channel.clone());
-        let stream_client = StreamManagerServiceClient::new(channel.clone());
-        let user_client = UserServiceClient::new(channel.clone());
-        let scale_client = ScaleServiceClient::new(channel.clone());
-        let backup_client = BackupServiceClient::new(channel);
-        GrpcMetaClientCore {
-            cluster_client,
-            election_client,
-            heartbeat_client,
-            ddl_client,
-            hummock_client,
-            notification_client,
-            stream_client,
-            user_client,
-            scale_client,
-            backup_client,
-        }
-    }
-
-    async fn build_rpc_channel(addr: &str) -> Result<Channel> {
+    pub(crate) async fn build_rpc_channel(addr: &str) -> Result<Channel> {
         let endpoint = Endpoint::from_shared(addr.to_string())?
             .initial_connection_window_size(MAX_CONNECTION_WINDOW_SIZE);
         let retry_strategy = ExponentialBackoff::from_millis(Self::CONN_RETRY_BASE_INTERVAL_MS)
