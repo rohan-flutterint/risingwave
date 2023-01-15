@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +44,7 @@ use risingwave_pb::hummock::hummock_manager_service_client::HummockManagerServic
 use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::mutable_config::MutableConfig;
 use risingwave_pb::hummock::*;
 use risingwave_pb::leader::leader_service_client::LeaderServiceClient;
-use risingwave_pb::leader::{LeaderRequest, LeaderResponse, MembersRequest, MembersResponse};
+use risingwave_pb::leader::{LeaderRequest, MembersRequest, MembersResponse};
 use risingwave_pb::meta::cluster_service_client::ClusterServiceClient;
 use risingwave_pb::meta::heartbeat_request::{extra_info, ExtraInfo};
 use risingwave_pb::meta::heartbeat_service_client::HeartbeatServiceClient;
@@ -64,7 +64,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tokio_retry::strategy::{jitter, ExponentialBackoff};
 use tonic::transport::{Channel, Endpoint};
-use tonic::{Response, Status, Streaming};
+use tonic::{Streaming};
 
 use crate::error::{Result, RpcError};
 use crate::hummock_meta_client::{CompactTaskItem, HummockMetaClient};
@@ -121,7 +121,7 @@ impl MetaClient {
         worker_node_parallelism: usize,
     ) -> Result<Self> {
         let grpc_meta_client = GrpcMetaClient::new(meta_addr).await?;
-        grpc_meta_client.tick_loop(meta_addr).await?;
+        grpc_meta_client.start_election_loop(meta_addr).await?;
         let request = AddWorkerNodeRequest {
             worker_type: worker_type as i32,
             host: Some(addr.to_protobuf()),
@@ -923,7 +923,7 @@ impl GrpcMetaClient {
     // Max retry interval in ms for request to meta server.
     const REQUEST_RETRY_MAX_INTERVAL_MS: u64 = 5000;
 
-    async fn tick_loop(&self, addr: &str) -> Result<()> {
+    async fn start_election_loop(&self, addr: &str) -> Result<()> {
         let core = self.core.clone();
 
         let leader_address = addr.to_string();
@@ -963,7 +963,7 @@ impl GrpcMetaClient {
             }
 
             async fn tick_update_members(&mut self) -> Result<()> {
-                let members = None;
+                let mut members = None;
                 for (addr, client) in &self.members {
                     let members_resp = match client.to_owned().members(MembersRequest {}).await {
                         Ok(resp) => resp.into_inner(),
@@ -973,20 +973,37 @@ impl GrpcMetaClient {
                         }
                     };
 
-                    let members = members_resp.members;
-
-                    let member_addrs = members
-                        .into_iter()
+                    let member_addrs: HashSet<_> = members_resp
+                        .members
+                        .iter()
+                        .cloned()
                         .flat_map(|member| member.member_addr)
                         .map(|addr| Self::host_address_to_url(&addr))
-                        .sorted()
-                        .dedup()
-                        .collect_vec();
+                        .collect();
 
+                    members = Some(member_addrs);
                     break;
                 }
 
-                todo!()
+                let member_addrs = match members {
+                    None => return Err(RpcError::Internal(anyhow!("could not update members"))),
+                    Some(members) => members,
+                };
+
+                let mut new_members = HashMap::new();
+
+                for addr in member_addrs {
+                    if let Some(client) = self.members.remove(&addr) {
+                        new_members.insert(addr, client);
+                    } else {
+                        let channel = GrpcMetaClient::build_rpc_channel(addr.as_str()).await?;
+                        new_members.insert(addr, LeaderServiceClient::new(channel));
+                    }
+                }
+
+                self.members = new_members;
+
+                Ok(())
             }
 
             async fn tick_check_leader(&mut self) -> Result<()> {
@@ -1020,10 +1037,6 @@ impl GrpcMetaClient {
                     "could not ensure meta node leader"
                 )));
             }
-
-            async fn tick(&mut self) -> Result<()> {
-                Ok(())
-            }
         }
 
         let member_management = MemberManagement {
@@ -1040,7 +1053,15 @@ impl GrpcMetaClient {
                     _ = ticker.tick() => {}
                 }
 
-                if let Err(e) = member_management.tick().await {}
+                if let Err(e) = member_management.tick_update_members().await {
+                    tracing::error!("error happened when update members {}", e.to_string());
+                    continue;
+                }
+
+                if let Err(e) = member_management.tick_check_leader().await {
+                    tracing::error!("error happened when update election lead {}", e.to_string());
+                    continue;
+                }
             }
         });
 
