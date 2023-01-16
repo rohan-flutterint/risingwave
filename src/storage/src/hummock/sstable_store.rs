@@ -206,9 +206,11 @@ impl SstableStore {
             .map_err(HummockError::object_io_error)
     }
 
-    pub async fn get(
+    pub async fn get_with_block_info(
         &self,
-        sst: &Sstable,
+        sst_id: HummockSstableId,
+        block_loc: BlockLocation,
+        uncompressed_capacity: usize,
         block_index: u64,
         policy: CachePolicy,
         stats: &mut StoreLocalStatistic,
@@ -217,21 +219,9 @@ impl SstableStore {
         let mut fetch_block = || {
             let tiered_cache = self.tiered_cache.clone();
             stats.cache_data_block_miss += 1;
-            let block_meta = sst
-                .meta
-                .block_metas
-                .get(block_index as usize)
-                .ok_or_else(HummockError::invalid_block)
-                .unwrap(); // FIXME: don't unwrap here.
-            let block_loc = BlockLocation {
-                offset: block_meta.offset as usize,
-                size: block_meta.len as usize,
-            };
-            let data_path = self.get_sst_data_path(sst.id);
+            let data_path = self.get_sst_data_path(sst_id);
             let store = self.store.clone();
-            let sst_id = sst.id;
             let use_tiered_cache = !matches!(policy, CachePolicy::Disable);
-            let uncompressed_capacity = block_meta.uncompressed_size as usize;
 
             async move {
                 if use_tiered_cache && let Some(holder) = tiered_cache
@@ -263,14 +253,14 @@ impl SstableStore {
         match policy {
             CachePolicy::Fill => {
                 self.block_cache
-                    .get_or_insert_with(sst.id, block_index, fetch_block)
+                    .get_or_insert_with(sst_id, block_index, fetch_block)
                     .await
             }
-            CachePolicy::NotFill => match self.block_cache.get(sst.id, block_index) {
+            CachePolicy::NotFill => match self.block_cache.get(sst_id, block_index) {
                 Some(block) => Ok(block),
                 None => match self
                     .tiered_cache
-                    .get(&(sst.id, block_index))
+                    .get(&(sst_id, block_index))
                     .await
                     .map_err(HummockError::tiered_cache)?
                 {
@@ -280,6 +270,35 @@ impl SstableStore {
             },
             CachePolicy::Disable => fetch_block().await.map(BlockHolder::from_owned_block),
         }
+    }
+
+    pub async fn get(
+        &self,
+        sst: &Sstable,
+        block_index: u64,
+        policy: CachePolicy,
+        stats: &mut StoreLocalStatistic,
+    ) -> HummockResult<BlockHolder> {
+        let block_meta = sst
+            .meta
+            .block_metas
+            .get(block_index as usize)
+            .ok_or_else(HummockError::invalid_block)
+            .unwrap(); // FIXME: don't unwrap here.
+        let block_loc = BlockLocation {
+            offset: block_meta.offset as usize,
+            size: block_meta.len as usize,
+        };
+        let uncompressed_capacity = block_meta.uncompressed_size as usize;
+        self.get_with_block_info(
+            sst.id,
+            block_loc,
+            uncompressed_capacity,
+            block_index,
+            policy,
+            stats,
+        )
+        .await
     }
 
     pub fn get_sst_data_path(&self, sst_id: HummockSstableId) -> String {

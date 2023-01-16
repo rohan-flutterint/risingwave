@@ -130,6 +130,15 @@ pub trait HummockIterator: Send + Sync + 'static {
     ///   before starting iteration.
     fn seek<'a>(&'a mut self, key: FullKey<&'a [u8]>) -> Self::SeekFuture<'a>;
 
+    /// Same as `seek`, except that parameter `upper_bound_key_hint` might be used to do prefetch.
+    fn seek_with_upper_bound_hint<'a>(
+        &'a mut self,
+        key: FullKey<&'a [u8]>,
+        _upper_bound_key_hint: FullKey<&'a [u8]>,
+    ) -> Self::SeekFuture<'a> {
+        self.seek(key)
+    }
+
     /// take local statistic info from iterator to report metrics.
     fn collect_local_statistic(&self, _stats: &mut StoreLocalStatistic);
 }

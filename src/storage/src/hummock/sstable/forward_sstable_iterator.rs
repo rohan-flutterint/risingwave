@@ -18,11 +18,12 @@ use std::sync::Arc;
 
 use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::KeyComparator;
+use risingwave_object_store::object::BlockLocation;
 
 use super::super::{HummockResult, HummockValue};
 use crate::hummock::iterator::{Forward, HummockIterator};
 use crate::hummock::sstable::SstableIteratorReadOptions;
-use crate::hummock::{BlockIterator, SstableStoreRef, TableHolder};
+use crate::hummock::{BlockIterator, HummockError, SstableStoreRef, TableHolder};
 use crate::monitor::StoreLocalStatistic;
 
 pub trait SstableIteratorType: HummockIterator + 'static {
@@ -64,7 +65,12 @@ impl SstableIterator {
     }
 
     /// Seeks to a block, and then seeks to the key if `seek_key` is given.
-    async fn seek_idx(&mut self, idx: usize, seek_key: Option<&[u8]>) -> HummockResult<()> {
+    async fn seek_idx(
+        &mut self,
+        idx: usize,
+        seek_key: Option<&[u8]>,
+        prefetch_num: usize,
+    ) -> HummockResult<()> {
         tracing::trace!(
             target: "events::storage::sstable::block_seek",
             "table iterator seek: sstable_id = {}, block_id = {}",
@@ -80,6 +86,36 @@ impl SstableIterator {
         if idx >= self.sst.value().block_count() {
             self.block_iter = None;
         } else {
+            if prefetch_num >= 1 {
+                // todo: do more prefetches
+                let prefetch_block_index = idx + 1;
+                let sst = self.sst.value();
+                let sst_id = sst.id;
+                let block_meta = sst
+                    .meta
+                    .block_metas
+                    .get(prefetch_block_index)
+                    .ok_or_else(HummockError::invalid_block)
+                    .unwrap(); // FIXME: don't unwrap here.
+                let block_loc = BlockLocation {
+                    offset: block_meta.offset as usize,
+                    size: block_meta.len as usize,
+                };
+                let uncompressed_capacity = block_meta.uncompressed_size as usize;
+                let sstable_store = self.sstable_store.clone();
+                tokio::spawn(async move {
+                    sstable_store
+                        .get_with_block_info(
+                            sst_id,
+                            block_loc,
+                            uncompressed_capacity,
+                            prefetch_block_index as u64,
+                            crate::hummock::CachePolicy::Fill,
+                            &mut StoreLocalStatistic::default(),
+                        )
+                        .await
+                });
+            }
             let block = self
                 .sstable_store
                 .get(
@@ -102,6 +138,54 @@ impl SstableIterator {
 
         Ok(())
     }
+
+    async fn seek_inner<'a>(
+        &'a mut self,
+        key: FullKey<&'a [u8]>,
+        upper_bound_key_hint: Option<FullKey<&'a [u8]>>,
+    ) -> HummockResult<()> {
+        let encoded_key = key.encode();
+        let block_idx = self
+            .sst
+            .value()
+            .meta
+            .block_metas
+            .partition_point(|block_meta| {
+                // compare by version comparator
+                // Note: we are comparing against the `smallest_key` of the `block`, thus the
+                // partition point should be `prev(<=)` instead of `<`.
+                let ord = KeyComparator::compare_encoded_full_key(
+                    block_meta.smallest_key.as_slice(),
+                    encoded_key.as_slice(),
+                );
+                ord == Less || ord == Equal
+            })
+            .saturating_sub(1); // considering the boundary of 0
+
+        let prefetch_block_num : usize= if let Some(upper_bound_key_hint) = upper_bound_key_hint && let Some(block_meta) = self.sst.value().meta.block_metas.get(block_idx+1) {
+                let ord = KeyComparator::compare_encoded_full_key(
+                    block_meta.smallest_key.as_slice(),
+                    upper_bound_key_hint.encode().as_slice(),
+                );
+                if ord == Less {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+        self.seek_idx(block_idx, Some(encoded_key.as_slice()), prefetch_block_num)
+            .await?;
+        if !self.is_valid() {
+            // seek to next block
+            self.seek_idx(block_idx + 1, None, prefetch_block_num.saturating_sub(1))
+                .await?;
+        }
+
+        Ok(())
+    }
 }
 
 impl HummockIterator for SstableIterator {
@@ -119,7 +203,7 @@ impl HummockIterator for SstableIterator {
                 Ok(())
             } else {
                 // seek to next block
-                self.seek_idx(self.cur_idx + 1, None).await
+                self.seek_idx(self.cur_idx + 1, None, 0).await
             }
         }
     }
@@ -139,38 +223,19 @@ impl HummockIterator for SstableIterator {
     }
 
     fn rewind(&mut self) -> Self::RewindFuture<'_> {
-        async move { self.seek_idx(0, None).await }
+        async move { self.seek_idx(0, None, 0).await }
     }
 
     fn seek<'a>(&'a mut self, key: FullKey<&'a [u8]>) -> Self::SeekFuture<'a> {
-        async move {
-            let encoded_key = key.encode();
-            let block_idx = self
-                .sst
-                .value()
-                .meta
-                .block_metas
-                .partition_point(|block_meta| {
-                    // compare by version comparator
-                    // Note: we are comparing against the `smallest_key` of the `block`, thus the
-                    // partition point should be `prev(<=)` instead of `<`.
-                    let ord = KeyComparator::compare_encoded_full_key(
-                        block_meta.smallest_key.as_slice(),
-                        encoded_key.as_slice(),
-                    );
-                    ord == Less || ord == Equal
-                })
-                .saturating_sub(1); // considering the boundary of 0
+        self.seek_inner(key, None)
+    }
 
-            self.seek_idx(block_idx, Some(encoded_key.as_slice()))
-                .await?;
-            if !self.is_valid() {
-                // seek to next block
-                self.seek_idx(block_idx + 1, None).await?;
-            }
-
-            Ok(())
-        }
+    fn seek_with_upper_bound_hint<'a>(
+        &'a mut self,
+        key: FullKey<&'a [u8]>,
+        upper_bound_key_hint: FullKey<&'a [u8]>,
+    ) -> Self::SeekFuture<'a> {
+        self.seek_inner(key, Some(upper_bound_key_hint))
     }
 
     fn collect_local_statistic(&self, stats: &mut StoreLocalStatistic) {
