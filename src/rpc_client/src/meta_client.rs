@@ -905,7 +905,7 @@ impl GrpcMetaClientCore {
 /// It is a wrapper of tonic client. See [`rpc_client_method_impl`].
 #[derive(Debug, Clone)]
 struct GrpcMetaClient {
-    force_update: tokio::sync::mpsc::Sender<oneshot::Sender<Result<()>>>,
+    force_refresh: tokio::sync::mpsc::Sender<oneshot::Sender<Result<()>>>,
     core: Arc<Mutex<GrpcMetaClientCore>>,
 }
 
@@ -928,7 +928,7 @@ impl GrpcMetaClient {
     async fn start_election_loop(
         &self,
         addr: &str,
-        force_update_receiver: Receiver<Sender<Result<()>>>,
+        force_refresh_receiver: Receiver<Sender<Result<()>>>,
     ) -> Result<()> {
         tracing::info!("using {} as initial leader", addr);
         let core = self.core.clone();
@@ -951,33 +951,33 @@ impl GrpcMetaClient {
             }
         }
 
-        struct MemberManagement {
+        struct ElectionMemberManagement {
             core_ref: Arc<Mutex<GrpcMetaClientCore>>,
             members: HashMap<String, LeaderServiceClient<Channel>>,
             current_leader: String,
         }
 
-        impl MemberManagement {
+        impl ElectionMemberManagement {
             fn host_address_to_url(addr: &HostAddress) -> String {
                 format!("http://{}:{}", addr.host, addr.port)
             }
 
-            async fn recreate_core(&mut self, channel: Channel) {
+            async fn recreate_core(&self, channel: Channel) {
                 let mut core = self.core_ref.lock().await;
                 *core = GrpcMetaClientCore::new(channel);
             }
 
             async fn tick(&mut self) -> Result<()> {
-                self.tick_update_members()
+                self.refresh_members()
                     .await
-                    .context("error happened when update members")?;
-                self.tick_check_leader()
+                    .context("error happened when refresh election members")?;
+                self.refresh_leader()
                     .await
-                    .context("error happened when update election leader")?;
+                    .context("error happened when refresh election leader")?;
                 Ok(())
             }
 
-            async fn tick_update_members(&mut self) -> Result<()> {
+            async fn refresh_members(&mut self) -> Result<()> {
                 let mut members = None;
                 for (addr, client) in &self.members {
                     let members_resp = match client.to_owned().members(MembersRequest {}).await {
@@ -1001,7 +1001,7 @@ impl GrpcMetaClient {
                 }
 
                 let member_addrs = match members {
-                    None => return Err(RpcError::Internal(anyhow!("could not update members"))),
+                    None => return Err(RpcError::Internal(anyhow!("could not refresh members"))),
                     Some(members) => members,
                 };
 
@@ -1021,7 +1021,7 @@ impl GrpcMetaClient {
                 Ok(())
             }
 
-            async fn tick_check_leader(&mut self) -> Result<()> {
+            async fn refresh_leader(&mut self) -> Result<()> {
                 for (addr, client) in &self.members {
                     let leader_resp = match client.to_owned().leader(LeaderRequest {}).await {
                         Ok(resp) => resp.into_inner(),
@@ -1054,13 +1054,13 @@ impl GrpcMetaClient {
             }
         }
 
-        let member_management = MemberManagement {
+        let member_management = ElectionMemberManagement {
             core_ref: core,
             members: member_map,
             current_leader: leader_address,
         };
 
-        let mut force_update_receiver = force_update_receiver;
+        let mut force_refresh_receiver = force_refresh_receiver;
 
         tokio::spawn(async move {
             let mut member_management = member_management;
@@ -1069,15 +1069,16 @@ impl GrpcMetaClient {
             loop {
                 let result_sender: Option<oneshot::Sender<Result<()>>> = tokio::select! {
                     _ = ticker.tick() => None,
-                    sender = force_update_receiver.recv() => sender,
+                    result_sender = force_refresh_receiver.recv() => result_sender,
                 };
 
                 let tick_result = member_management.tick().await;
                 if let Err(e) = tick_result.as_ref() {
-                    tracing::error!("update election client failed {}", e);
+                    tracing::error!("refresh election client failed {}", e);
                 }
 
                 if let Some(sender) = result_sender {
+                    // ignore resp
                     let _resp = sender.send(tick_result);
                 }
             }
@@ -1088,7 +1089,7 @@ impl GrpcMetaClient {
 
     async fn force_refresh_leader(&self) -> Result<()> {
         let (sender, receiver) = oneshot::channel();
-        self.force_update
+        self.force_refresh
             .send(sender)
             .await
             .map_err(|e| anyhow!(e))?;
@@ -1099,15 +1100,15 @@ impl GrpcMetaClient {
     pub async fn new(addr: &str) -> Result<Self> {
         let channel = Self::build_rpc_channel(addr).await?;
 
-        let (force_update_sender, force_update_receiver) = tokio::sync::mpsc::channel(128);
+        let (force_refresh_sender, force_refresh_receiver) = tokio::sync::mpsc::channel(128);
 
         let client = GrpcMetaClient {
-            force_update: force_update_sender,
+            force_refresh: force_refresh_sender,
             core: Arc::new(Mutex::new(GrpcMetaClientCore::new(channel))),
         };
 
         client
-            .start_election_loop(addr, force_update_receiver)
+            .start_election_loop(addr, force_refresh_receiver)
             .await?;
 
         tracing::info!("force refresh leader of meta-node");
