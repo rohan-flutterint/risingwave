@@ -44,7 +44,7 @@ use risingwave_pb::hummock::hummock_manager_service_client::HummockManagerServic
 use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::mutable_config::MutableConfig;
 use risingwave_pb::hummock::*;
 use risingwave_pb::leader::leader_service_client::LeaderServiceClient;
-use risingwave_pb::leader::{LeaderRequest, MembersRequest, MembersResponse};
+use risingwave_pb::leader::{LeaderRequest, MembersRequest};
 use risingwave_pb::meta::cluster_service_client::ClusterServiceClient;
 use risingwave_pb::meta::heartbeat_request::{extra_info, ExtraInfo};
 use risingwave_pb::meta::heartbeat_service_client::HeartbeatServiceClient;
@@ -122,7 +122,6 @@ impl MetaClient {
         worker_node_parallelism: usize,
     ) -> Result<Self> {
         let grpc_meta_client = GrpcMetaClient::new(meta_addr).await?;
-
         let request = AddWorkerNodeRequest {
             worker_type: worker_type as i32,
             host: Some(addr.to_protobuf()),
@@ -931,25 +930,13 @@ impl GrpcMetaClient {
         force_refresh_receiver: Receiver<Sender<Result<()>>>,
     ) -> Result<()> {
         tracing::info!("using {} as initial leader", addr);
-        let core = self.core.clone();
-        let leader_address = addr.to_string();
-        let MembersResponse { members } = core
-            .lock()
-            .await
-            .election_client
-            .members(MembersRequest {})
-            .await?
-            .into_inner();
+        let core_ref = self.core.clone();
+        let current_leader = addr.to_string();
+        let mut members = HashMap::new();
 
-        let mut member_map = HashMap::new();
-
-        for member in members {
-            if let Some(member_addr) = member.member_addr {
-                let addr = format!("http://{}:{}", member_addr.host, member_addr.port);
-                let channel = Self::build_rpc_channel(&addr).await?;
-                member_map.insert(addr, LeaderServiceClient::new(channel));
-            }
-        }
+        // we use addr and election_client as default members
+        let init_election_client = core_ref.lock().await.election_client.clone();
+        members.insert(current_leader.clone(), init_election_client);
 
         struct ElectionMemberManagement {
             core_ref: Arc<Mutex<GrpcMetaClientCore>>,
@@ -1055,9 +1042,9 @@ impl GrpcMetaClient {
         }
 
         let member_management = ElectionMemberManagement {
-            core_ref: core,
-            members: member_map,
-            current_leader: leader_address,
+            core_ref,
+            members,
+            current_leader,
         };
 
         let mut force_refresh_receiver = force_refresh_receiver;
@@ -1112,7 +1099,10 @@ impl GrpcMetaClient {
             .await?;
 
         tracing::info!("force refresh leader of meta-node");
-        client.force_refresh_leader().await?;
+
+        if let Err(e) = client.force_refresh_leader().await {
+            tracing::warn!("force refresh leader failed {}, init leader may failed", e);
+        }
 
         Ok(client)
     }

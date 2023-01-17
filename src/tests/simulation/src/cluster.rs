@@ -166,7 +166,7 @@ impl Cluster {
             ]);
             handle
                 .create_node()
-                .name("meta")
+                .name(format!("meta-{i}"))
                 .ip([192, 168, 1, i as u8].into())
                 .init(move || risingwave_meta::start(opts.clone()))
                 .build();
@@ -351,8 +351,15 @@ impl Cluster {
     pub async fn kill_node(&self, opts: &KillOpts) {
         let mut nodes = vec![];
         if opts.kill_meta {
-            if rand::thread_rng().gen_bool(0.5) {
-                nodes.push("meta".to_string());
+            let rand = rand::thread_rng().gen_range(0..3);
+            for i in 1..=self.config.meta_nodes {
+                match rand {
+                    0 => break,                                         // no killed
+                    1 => {}                                             // all killed
+                    _ if !rand::thread_rng().gen_bool(0.5) => continue, // random killed
+                    _ => {}
+                }
+                nodes.push(format!("meta-{}", i));
             }
         }
         if opts.kill_frontend {
