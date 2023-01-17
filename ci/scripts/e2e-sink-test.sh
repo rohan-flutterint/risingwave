@@ -63,7 +63,10 @@ psql -h db -U postgres -d test -c "CREATE TABLE t_remote (id serial PRIMARY KEY,
 echo "--- starting risingwave cluster with connector node"
 cargo make ci-start ci-1cn-1fe
 java -jar ./connector-service.jar --port 60061 > .risingwave/log/connector-source.log 2>&1 &
-sleep 1
+echo "waiting for connector node to start"
+while ! nc -z localhost 60061; do
+  sleep 0.1
+done
 
 echo "--- testing sinks"
 sqllogictest -p 4566 -d dev './e2e_test/sink/*.slt'
